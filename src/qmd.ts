@@ -27,6 +27,7 @@ import {
   getHashesForEmbedding,
   clearAllEmbeddings,
   insertEmbedding,
+  insertEmbeddingBatch,
   getStatus,
   hashContent,
   extractTitle,
@@ -70,7 +71,7 @@ import {
   createStore,
   getDefaultDbPath,
 } from "./store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, getDefaultOllamaEmbed, printEmbedderStats } from "./llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -1591,86 +1592,52 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   const totalChunks = allChunks.length;
   const totalDocs = hashesToEmbed.length;
 
-  console.log(`${c.bold}Embedding ${totalDocs} documents${c.reset} ${c.dim}(${totalChunks} chunks, ${formatBytes(totalBytes)})${c.reset}`);
-  if (multiChunkDocs > 0) {
-    console.log(`${c.dim}${multiChunkDocs} documents split into multiple chunks${c.reset}`);
-  }
-  console.log(`${c.dim}Model: ${model}${c.reset}\n`);
-
   // Hide cursor during embedding
   cursor.hide();
 
-  // Wrap all LLM embedding operations in a session for lifecycle management
-  // Use 30 minute timeout for large collections
-  await withLLMSession(async (session) => {
-    // Get embedding dimensions from first chunk
+  // Try Ollama first (multi-server, GPU-accelerated), fall back to LlamaCpp
+  const useOllama = process.env.QMD_EMBED_BACKEND !== 'llamacpp';
+
+  if (useOllama) {
+    // --- Ollama backend: multi-server, work-stealing, streaming ---
+    const ollama = getDefaultOllamaEmbed();
+
+    // Probe servers (warms models, detects dimensions)
     progress.indeterminate();
-    const firstChunk = allChunks[0];
-    if (!firstChunk) {
-      throw new Error("No chunks available to embed");
+    await ollama.embedBatch(["init"]);
+    const dims = ollama.getDimensions();
+    if (!dims) {
+      throw new Error("Failed to detect embedding dimensions from Ollama probe");
     }
-    const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
-    const firstResult = await session.embed(firstText);
-    if (!firstResult) {
-      throw new Error("Failed to get embedding dimensions from first chunk");
-    }
-    ensureVecTable(db, firstResult.embedding.length);
+
+    console.log(`${c.bold}Embedding ${totalDocs} docs${c.reset} ${c.dim}(${totalChunks} chunks, ${formatBytes(totalBytes)}) · ${model}${c.reset}`);
+
+    ensureVecTable(db, dims);
+    const allTexts = allChunks.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
 
     let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
     const startTime = Date.now();
+    let linesDrawn = 0;
 
-    // Batch embedding for better throughput
-    // Process in batches of 32 to balance memory usage and efficiency
-    const BATCH_SIZE = 32;
-
-    for (let batchStart = 0; batchStart < allChunks.length; batchStart += BATCH_SIZE) {
-      const batchEnd = Math.min(batchStart + BATCH_SIZE, allChunks.length);
-      const batch = allChunks.slice(batchStart, batchEnd);
-
-      // Format texts for embedding
-      const texts = batch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
-
-      try {
-        // Batch embed all texts at once
-        const embeddings = await session.embedBatch(texts);
-
-        // Insert each embedding
-        for (let i = 0; i < batch.length; i++) {
-          const chunk = batch[i]!;
-          const embedding = embeddings[i];
-
-          if (embedding) {
-            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
-            chunksEmbedded++;
-          } else {
-            errors++;
-            console.error(`\n${c.yellow}⚠ Error embedding "${chunk.displayName}" chunk ${chunk.seq}${c.reset}`);
-          }
-          bytesProcessed += chunk.bytes;
+    await ollama.embedStream(allTexts, (startIdx, results) => {
+      const dbBatch: { hash: string; seq: number; pos: number; embedding: Float32Array; model: string; embeddedAt: string }[] = [];
+      for (let i = 0; i < results.length; i++) {
+        const chunkIdx = startIdx + i;
+        const chunk = allChunks[chunkIdx]!;
+        const embedding = results[i];
+        if (embedding) {
+          dbBatch.push({ hash: chunk.hash, seq: chunk.seq, pos: chunk.pos, embedding: new Float32Array(embedding.embedding), model, embeddedAt: now });
+          chunksEmbedded++;
+        } else {
+          errors++;
         }
-      } catch (err) {
-        // If batch fails, try individual embeddings as fallback
-        for (const chunk of batch) {
-          try {
-            const text = formatDocForEmbedding(chunk.text, chunk.title);
-            const result = await session.embed(text);
-            if (result) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
-              chunksEmbedded++;
-            } else {
-              errors++;
-            }
-          } catch (innerErr) {
-            errors++;
-            console.error(`\n${c.yellow}⚠ Error embedding "${chunk.displayName}" chunk ${chunk.seq}: ${innerErr}${c.reset}`);
-          }
-          bytesProcessed += chunk.bytes;
-        }
+        bytesProcessed += chunk.bytes;
       }
+
+      insertEmbeddingBatch(db, dbBatch);
 
       const percent = (bytesProcessed / totalBytes) * 100;
       progress.set(percent);
-
       const elapsed = (Date.now() - startTime) / 1000;
       const bytesPerSec = bytesProcessed / elapsed;
       const remainingBytes = totalBytes - bytesProcessed;
@@ -1682,20 +1649,118 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
       const eta = elapsed > 2 ? formatETA(etaSec) : "...";
       const errStr = errors > 0 ? ` ${c.yellow}${errors} err${c.reset}` : "";
 
-      process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${chunksEmbedded}/${totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
-    }
+      // Build live per-server stats line
+      const serverStats = ollama.getStats().filter((s) => s.textsProcessed > 0);
+      const totalTexts = serverStats.reduce((sum, s) => sum + s.textsProcessed, 0) || 1;
+      const serverLine = serverStats.map((s) => {
+        const name = s.url.replace("http://", "").replace(":11434", "");
+        const short = name.length > 6 ? name.slice(0, 6) : name;
+        const pct = ((s.textsProcessed / totalTexts) * 100).toFixed(0);
+        const tps = s.totalMs > 0 ? ((s.textsProcessed / s.totalMs) * 1000).toFixed(0) : "0";
+        const avg = s.requestCount > 0 ? (s.totalMs / s.requestCount).toFixed(0) : "0";
+        return `${c.bold}${short}${c.reset}${c.dim}:${tps} chunks/s ${pct}% ~${avg}ms${c.reset}`;
+      }).join("  ");
+
+      // 2-line live display: server stats + progress bar
+      if (linesDrawn > 0) {
+        process.stderr.write(`\x1b[${linesDrawn}A`);
+      }
+      process.stderr.write(`\r\x1b[K${serverLine}\n`);
+      process.stderr.write(`\r\x1b[K${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${chunksEmbedded}/${totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}`);
+      linesDrawn = 2;
+    });
 
     progress.clear();
     cursor.show();
     const totalTimeSec = (Date.now() - startTime) / 1000;
     const avgThroughput = formatBytes(totalBytes / totalTimeSec);
 
-    console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
+    if (linesDrawn > 0) {
+      process.stderr.write(`\x1b[${linesDrawn}A`);
+      process.stderr.write(`\r\x1b[K\n\r\x1b[K`);
+      process.stderr.write(`\x1b[${linesDrawn}A`);
+    }
+    console.log(`${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
     console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${chunksEmbedded}${c.reset} chunks from ${c.bold}${totalDocs}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset} ${c.dim}(${avgThroughput}/s)${c.reset}`);
     if (errors > 0) {
       console.log(`${c.yellow}⚠ ${errors} chunks failed${c.reset}`);
     }
-  }, { maxDuration: 30 * 60 * 1000, name: 'embed-command' });
+    printEmbedderStats();
+  } else {
+    // --- LlamaCpp backend: original single-GPU path ---
+    console.log(`${c.bold}Embedding ${totalDocs} documents${c.reset} ${c.dim}(${totalChunks} chunks, ${formatBytes(totalBytes)})${c.reset}`);
+    if (multiChunkDocs > 0) {
+      console.log(`${c.dim}${multiChunkDocs} documents split into multiple chunks${c.reset}`);
+    }
+    console.log(`${c.dim}Model: ${model}${c.reset}\n`);
+
+    await withLLMSession(async (session) => {
+      progress.indeterminate();
+      const firstChunk = allChunks[0];
+      if (!firstChunk) throw new Error("No chunks available to embed");
+      const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
+      const firstResult = await session.embed(firstText);
+      if (!firstResult) throw new Error("Failed to get embedding dimensions from first chunk");
+      ensureVecTable(db, firstResult.embedding.length);
+
+      let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
+      const startTime = Date.now();
+      const BATCH_SIZE = 32;
+
+      for (let batchStart = 0; batchStart < allChunks.length; batchStart += BATCH_SIZE) {
+        const batchEnd = Math.min(batchStart + BATCH_SIZE, allChunks.length);
+        const batch = allChunks.slice(batchStart, batchEnd);
+        const texts = batch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
+
+        try {
+          const embeddings = await session.embedBatch(texts);
+          for (let i = 0; i < batch.length; i++) {
+            const chunk = batch[i]!;
+            const embedding = embeddings[i];
+            if (embedding) {
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
+              chunksEmbedded++;
+            } else {
+              errors++;
+            }
+            bytesProcessed += chunk.bytes;
+          }
+        } catch (err) {
+          for (const chunk of batch) {
+            try {
+              const text = formatDocForEmbedding(chunk.text, chunk.title);
+              const result = await session.embed(text);
+              if (result) {
+                insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+                chunksEmbedded++;
+              } else { errors++; }
+            } catch { errors++; }
+            bytesProcessed += chunk.bytes;
+          }
+        }
+
+        const percent = (bytesProcessed / totalBytes) * 100;
+        progress.set(percent);
+        const elapsed = (Date.now() - startTime) / 1000;
+        const bytesPerSec = bytesProcessed / elapsed;
+        const etaSec = (totalBytes - bytesProcessed) / bytesPerSec;
+        const bar = renderProgressBar(percent);
+        const percentStr = percent.toFixed(0).padStart(3);
+        const throughput = `${formatBytes(bytesPerSec)}/s`;
+        const eta = elapsed > 2 ? formatETA(etaSec) : "...";
+        const errStr = errors > 0 ? ` ${c.yellow}${errors} err${c.reset}` : "";
+        process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${chunksEmbedded}/${totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
+      }
+
+      progress.clear();
+      cursor.show();
+      const totalTimeSec = (Date.now() - startTime) / 1000;
+      const avgThroughput = formatBytes(totalBytes / totalTimeSec);
+      console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
+      console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${chunksEmbedded}${c.reset} chunks from ${c.bold}${totalDocs}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset} ${c.dim}(${avgThroughput}/s)${c.reset}`);
+      if (errors > 0) console.log(`${c.yellow}⚠ ${errors} chunks failed${c.reset}`);
+    }, { maxDuration: 30 * 60 * 1000, name: 'embed-command' });
+  }
 
   closeDb();
 }

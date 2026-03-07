@@ -2294,6 +2294,31 @@ export function insertEmbedding(
   insertContentVectorStmt.run(hash, seq, pos, model, embeddedAt);
 }
 
+/**
+ * Batch insert embeddings in a single transaction for better throughput.
+ */
+export function insertEmbeddingBatch(
+  db: Database,
+  batch: { hash: string; seq: number; pos: number; embedding: Float32Array; model: string; embeddedAt: string }[]
+): void {
+  if (batch.length === 0) return;
+  const insertVecStmt = db.prepare(`INSERT OR REPLACE INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
+  const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, ?, ?)`);
+
+  db.exec("BEGIN");
+  try {
+    for (const item of batch) {
+      const hashSeq = `${item.hash}_${item.seq}`;
+      insertVecStmt.run(hashSeq, item.embedding);
+      insertContentVectorStmt.run(item.hash, item.seq, item.pos, item.model, item.embeddedAt);
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+}
+
 // =============================================================================
 // Query expansion
 // =============================================================================
