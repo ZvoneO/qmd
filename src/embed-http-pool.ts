@@ -524,9 +524,20 @@ export async function generateEmbeddingsViaPool(
   let bytesProcessed = 0;
   const totalChunks = allChunks.length;
 
-  // Larger sub-batch amortizes per-request latency. Default was 16
-  // (legacy fork value); 64 balances throughput against memory peak.
-  const SUB_BATCH = Number(process.env.QMD_EMBED_SUB_BATCH ?? 64);
+  // SUB_BATCH balances two pressures: large = closer to /v1/embeddings
+  // ceiling (per-request overhead amortized), small = better parallelism
+  // (each server pulls work independently from the queue). On a tiny
+  // corpus, large SUB_BATCH means one server gets the whole job — the
+  // others sit idle. Auto-pick scales with corpus size and pool size,
+  // capped at 128 to keep memory peaks bounded.
+  const numServers = pool.getActiveUrls().length;
+  const auto = Math.min(
+    128,
+    Math.max(16, Math.floor(totalChunks / Math.max(numServers, 1) / 4)),
+  );
+  const SUB_BATCH = process.env.QMD_EMBED_SUB_BATCH
+    ? Number(process.env.QMD_EMBED_SUB_BATCH)
+    : auto;
 
   await pool.embedStream(texts, (startIdx, results) => {
     // Wrap each callback's inserts in a single transaction.
