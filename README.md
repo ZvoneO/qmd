@@ -822,6 +822,36 @@ qmd embed -c my-collection -f
 
 Avoid mixing llama-server backends with a local Ollama URL in the same pool — Ollama's `/api/embed` is ~5× slower per request and stalls the shared queue because work is round-robined.
 
+### On-demand backend lifecycle
+
+For each URL in `QMD_EMBED_URLS`, qmd can probe, start (if cold), and stop (on exit) the remote llama-server via SSH. Configure in `~/.config/qmd/embed-backends.yaml`:
+
+```yaml
+backends:
+  - url: http://gb10c:8081
+    ssh: strives@gb10c       # passwordless ssh required
+    health_path: /health     # default
+    ready_timeout_s: 60      # default 30
+    start: |
+      ollama stop embeddinggemma:300m 2>/dev/null || true
+      cd ~/llama.cpp && export LD_LIBRARY_PATH=/usr/local/cuda/lib64
+      nohup ./build/bin/llama-server -m $HOME/models/embeddinggemma-300m-Q8_0.gguf \
+        --embeddings --port 8081 --host 0.0.0.0 -ngl 99 -ub 2048 -b 2048 \
+        --parallel 4 -c 8192 > /tmp/lsrv.log 2>&1 &
+      disown
+    stop: |
+      pkill -f 'llama-server.*--port 8081' || true
+```
+
+Behavior per URL:
+- `GET <health_path>` returns 200 → **adopted**, lifecycle leaves it alone.
+- Unreachable + `start` script present → **cold-started** over SSH, polled for health up to `ready_timeout_s`. On process exit (or SIGINT/SIGTERM) the `stop` script runs.
+- Adopted servers are never stopped. Servers qmd started are always stopped on exit.
+
+The `start` script is the right place to stop conflicting Ollama models so llama-server doesn't fight Ollama for GPU memory.
+
+No config file = no lifecycle (URLs must be already running). Pool URLs without a matching `backends:` entry are probe-only too.
+
 ## How It Works
 
 ### Indexing Flow
