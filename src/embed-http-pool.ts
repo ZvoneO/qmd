@@ -23,6 +23,16 @@ import {
 } from "./store.js";
 import { BackendLifecycle, loadBackendConfig } from "./embed-lifecycle.js";
 
+/**
+ * Replace lone UTF-16 surrogates with U+FFFD. Chunking can split an emoji
+ * code point mid-surrogate-pair, leaving a high surrogate without its low
+ * partner (or vice versa). JSON.stringify emits these as bare \uDXXX which
+ * llama-server's nlohmann/json strict mode rejects with parse_error.101.
+ */
+function sanitizeForJson(s: string): string {
+  return s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "�");
+}
+
 function urlsFromBackendsConfig(): string[] | null {
   const cfg = loadBackendConfig();
   if (!cfg) return null;
@@ -168,6 +178,11 @@ export class HttpEmbedPool {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     const proto = this.protocols.get(baseUrl) ?? "ollama";
+    // Strip lone UTF-16 surrogates — chunking can split an emoji's surrogate
+    // pair, leaving a low surrogate without its high partner. JSON.stringify
+    // emits them as raw \uDXXX escapes which llama-server's nlohmann/json
+    // rejects as malformed JSON. Replace orphans with U+FFFD.
+    const safe = input.map(sanitizeForJson);
     try {
       if (proto === "llama") {
         // llama-server speaks OpenAI /v1/embeddings.
@@ -176,7 +191,7 @@ export class HttpEmbedPool {
         const res = await fetch(`${baseUrl}/v1/embeddings`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ model: this.model, input }),
+          body: JSON.stringify({ model: this.model, input: safe }),
           signal: controller.signal,
         });
         if (!res.ok) {
@@ -200,7 +215,7 @@ export class HttpEmbedPool {
       const res = await fetch(`${baseUrl}/api/embed`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: this.model, input, keep_alive: -1 }),
+        body: JSON.stringify({ model: this.model, input: safe, keep_alive: -1 }),
         signal: controller.signal,
       });
       if (!res.ok) {
