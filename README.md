@@ -438,11 +438,11 @@ The SDK requires explicit `dbPath` — no defaults are assumed. This makes it sa
 
 ### Search Backends
 
-| Backend | Raw Score | Conversion | Range |
-|---------|-----------|------------|-------|
-| **FTS (BM25)** | SQLite FTS5 BM25 | `Math.abs(score)` | 0 to ~25+ |
-| **Vector** | Cosine distance | `1 / (1 + distance)` | 0.0 to 1.0 |
-| **Reranker** | LLM 0-10 rating | `score / 10` | 0.0 to 1.0 |
+| Backend        | Raw Score        | Conversion           | Range      |
+|----------------|------------------|----------------------|------------|
+| **FTS (BM25)** | SQLite FTS5 BM25 | `Math.abs(score)`    | 0 to ~25+  |
+| **Vector**     | Cosine distance  | `1 / (1 + distance)` | 0.0 to 1.0 |
+| **Reranker**   | LLM 0-10 rating  | `score / 10`         | 0.0 to 1.0 |
 
 ### Fusion Strategy
 
@@ -463,12 +463,12 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
 
 ### Score Interpretation
 
-| Score | Meaning |
-|-------|---------|
-| 0.8 - 1.0 | Highly relevant |
+| Score     | Meaning             |
+|-----------|---------------------|
+| 0.8 - 1.0 | Highly relevant     |
 | 0.5 - 0.8 | Moderately relevant |
-| 0.2 - 0.5 | Somewhat relevant |
-| 0.0 - 0.2 | Low relevance |
+| 0.2 - 0.5 | Somewhat relevant   |
+| 0.0 - 0.2 | Low relevance       |
 
 ## Requirements
 
@@ -485,10 +485,10 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
 
 QMD uses three local GGUF models (auto-downloaded on first use):
 
-| Model | Purpose | Size |
-|-------|---------|------|
-| `embeddinggemma-300M-Q8_0` | Vector embeddings (default) | ~300MB |
-| `qwen3-reranker-0.6b-q8_0` | Re-ranking | ~640MB |
+| Model                             | Purpose                      | Size   |
+|-----------------------------------|------------------------------|--------|
+| `embeddinggemma-300M-Q8_0`        | Vector embeddings (default)  | ~300MB |
+| `qwen3-reranker-0.6b-q8_0`        | Re-ranking                   | ~640MB |
 | `qmd-query-expansion-1.7B-q4_k_m` | Query expansion (fine-tuned) | ~1.1GB |
 
 Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
@@ -794,11 +794,33 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
-| `QMD_LLAMA_GPU` | `auto` | Force llama.cpp GPU backend (`metal`, `vulkan`, `cuda`) or disable GPU with `false` |
-| `QMD_EMBED_PARALLELISM` | automatic | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable. |
+| Variable                | Default               | Description                                                                                                                                                                                                                                                                                                                                                                                                      |
+|-------------------------|-----------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `XDG_CACHE_HOME`        | `~/.cache`            | Cache directory location                                                                                                                                                                                                                                                                                                                                                                                         |
+| `QMD_LLAMA_GPU`         | `auto`                | Force llama.cpp GPU backend (`metal`, `vulkan`, `cuda`) or disable GPU with `false`                                                                                                                                                                                                                                                                                                                              |
+| `QMD_EMBED_PARALLELISM` | automatic             | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable.                                                                                                                                                                                                    |
+| `QMD_EMBED_URLS`        | unset                 | Comma-separated HTTP backend URLs for the multi-server embedding pool. When set, `qmd embed` distributes work across all reachable servers instead of using the in-process llama.cpp embedder. Each URL is probed for `GET /health` (llama-server, OpenAI `/v1/embeddings`); URLs that don't expose `/health` fall back to Ollama's `/api/embed`. Example: `QMD_EMBED_URLS=http://gb10c:8081,http://gb10d:8081`. |
+| `QMD_EMBED_SUB_BATCH`   | `64`                  | Texts per request sent to each pool worker. Larger values get closer to the raw `/v1/embeddings` ceiling on big corpora but cap parallelism on small ones (a single batch can only go to one server). Useful range: 32–256.                                                                                                                                                                                      |
+| `QMD_OLLAMA_MODEL`      | `embeddinggemma:300m` | Model identifier sent in pool embed requests. llama-server ignores this when only one model is loaded; Ollama requires a match against a pulled tag.                                                                                                                                                                                                                                                             |
+
+### Multi-server embedding pool
+
+Set `QMD_EMBED_URLS` to enable cross-host parallel embedding. The pool auto-detects each backend's protocol (llama-server vs Ollama) and load-balances work across all reachable servers via a shared queue.
+
+Recommended setup: run `llama-server` with the embeddinggemma GGUF on every GPU host you can reach, then point qmd at them:
+
+```bash
+# on each host with a GPU
+llama-server -hf ggml-org/embeddinggemma-300M-GGUF:Q8_0 \
+  --host 0.0.0.0 --port 8081 --embedding --pooling mean \
+  --parallel 8 --batch-size 512 --ubatch-size 512
+
+# on the qmd client
+export QMD_EMBED_URLS=http://gpu1:8081,http://gpu2:8081
+qmd embed -c my-collection -f
+```
+
+Avoid mixing llama-server backends with a local Ollama URL in the same pool — Ollama's `/api/embed` is ~5× slower per request and stalls the shared queue because work is round-robined.
 
 ## How It Works
 
@@ -837,19 +859,19 @@ Instead of cutting at hard token boundaries, QMD uses a scoring algorithm to fin
 
 **Break Point Scores:**
 
-| Pattern | Score | Description |
-|---------|-------|-------------|
-| `# Heading` | 100 | H1 - major section |
-| `## Heading` | 90 | H2 - subsection |
-| `### Heading` | 80 | H3 |
-| `#### Heading` | 70 | H4 |
-| `##### Heading` | 60 | H5 |
-| `###### Heading` | 50 | H6 |
-| ` ``` ` | 80 | Code block boundary |
-| `---` / `***` | 60 | Horizontal rule |
-| Blank line | 20 | Paragraph boundary |
-| `- item` / `1. item` | 5 | List item |
-| Line break | 1 | Minimal break |
+| Pattern              | Score | Description         |
+|----------------------|-------|---------------------|
+| `# Heading`          | 100   | H1 - major section  |
+| `## Heading`         | 90    | H2 - subsection     |
+| `### Heading`        | 80    | H3                  |
+| `#### Heading`       | 70    | H4                  |
+| `##### Heading`      | 60    | H5                  |
+| `###### Heading`     | 50    | H6                  |
+| ` ``` `              | 80    | Code block boundary |
+| `---` / `***`        | 60    | Horizontal rule     |
+| Blank line           | 20    | Paragraph boundary  |
+| `- item` / `1. item` | 5     | List item           |
+| Line break           | 1     | Minimal break       |
 
 **Algorithm:**
 
@@ -866,12 +888,12 @@ The squared distance decay means a heading 200 tokens back (score ~30) still bea
 
 For supported code files, QMD also parses the source with [tree-sitter](https://tree-sitter.github.io/) and adds AST-derived break points that are merged with the regex scores above:
 
-| AST Node | Score | Languages |
-|----------|-------|-----------|
-| Class / interface / struct / impl / trait | 100 | All |
-| Function / method | 90 | All |
-| Type alias / enum | 80 | All |
-| Import / use declaration | 60 | All |
+| AST Node                                  | Score | Languages |
+|-------------------------------------------|-------|-----------|
+| Class / interface / struct / impl / trait | 100   | All       |
+| Function / method                         | 90    | All       |
+| Type alias / enum                         | 80    | All       |
+| Import / use declaration                  | 60    | All       |
 
 Supported for `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`, and `.rs` files. Enable with `--chunk-strategy auto`. Markdown and other file types always use regex chunking.
 

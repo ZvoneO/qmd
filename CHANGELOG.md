@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Features
+
+- Embedding: multi-server HTTP pool (`QMD_EMBED_URLS`) now auto-detects llama-server vs Ollama backends. llama-server URLs are probed via `GET /health` and use OpenAI `POST /v1/embeddings`; URLs without `/health` fall back to Ollama `POST /api/embed`. Mixed pools work transparently. Measured 10× end-to-end speedup vs the previous Ollama-only path on a 288-chunk corpus; raw llama-server ceiling ~1200 c/s aggregate for a 2-node cluster. New env var `QMD_EMBED_SUB_BATCH` (default 64) tunes per-request batch size.
+
 ### Fixes
 
 - Embedding: `qmd embed -c <collection>` now scopes pending-doc selection
