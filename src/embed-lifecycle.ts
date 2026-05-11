@@ -121,6 +121,12 @@ export class BackendLifecycle {
 
     const ready: string[] = [];
     for (const url of urls) {
+      // In-process workers don't need lifecycle management.
+      if (url.startsWith("inprocess://")) {
+        this.records.set(url, { url, state: "adopted" });
+        ready.push(url);
+        continue;
+      }
       const def = defsByUrl.get(url);
       const healthPath = def?.health_path ?? DEFAULT_HEALTH_PATH;
 

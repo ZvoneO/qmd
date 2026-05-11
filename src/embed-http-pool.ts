@@ -11,7 +11,7 @@
 
 import type { Database } from "./db.js";
 import type { EmbeddingResult, EmbedOptions as LlmEmbedOptions } from "./llm.js";
-import { formatDocForEmbedding } from "./llm.js";
+import { formatDocForEmbedding, getDefaultLlamaCpp } from "./llm.js";
 import {
   type Store,
   type EmbedOptions,
@@ -72,7 +72,9 @@ export type ServerStats = {
  * Configure model via QMD_OLLAMA_MODEL environment variable:
  *   QMD_OLLAMA_MODEL=qwen3-embedding:0.6b
  */
-type Protocol = "llama" | "ollama";
+type Protocol = "llama" | "ollama" | "inprocess";
+
+const INPROCESS_SCHEME = "inprocess://";
 
 export class HttpEmbedPool {
   private urls: string[];
@@ -97,6 +99,12 @@ export class HttpEmbedPool {
 
   /** Probe a single URL. Tries llama-server /health first, falls back to Ollama /api/embed. */
   private async probeOne(url: string): Promise<number> {
+    // In-process worker: no network, always reachable. node-llama-cpp loads
+    // lazily on first embedBatch call; here we just register the protocol.
+    if (url.startsWith(INPROCESS_SCHEME)) {
+      this.protocols.set(url, "inprocess");
+      return 0;
+    }
     const t0 = Date.now();
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15_000);
@@ -157,8 +165,12 @@ export class HttpEmbedPool {
       );
     }
     const serverList = results.map((r) => {
-      const name = r.url.replace("http://", "").replace(":11434", "").replace(":8081", "");
       const proto = this.protocols.get(r.url);
+      if (proto === "inprocess") {
+        const label = r.url.replace(INPROCESS_SCHEME, "") || "local";
+        return `${label} (inprocess)`;
+      }
+      const name = r.url.replace("http://", "").replace(":11434", "").replace(":8081", "");
       return r.ok ? `${name} ${r.ms}ms (${proto})` : `${name} ✗`;
     }).join("  ");
     process.stderr.write(`Servers (ping): ${serverList}\n`);
@@ -184,6 +196,24 @@ export class HttpEmbedPool {
     // rejects as malformed JSON. Replace orphans with U+FFFD.
     const safe = input.map(sanitizeForJson);
     try {
+      if (proto === "inprocess") {
+        // In-process worker via node-llama-cpp. The LlamaCpp instance is
+        // already initialized for tokenization/chunking earlier in the run,
+        // so this adds no warmup cost. Errors are mapped to a thrown Error
+        // so the worker's retry loop handles them like HTTP failures.
+        const llm = getDefaultLlamaCpp();
+        const results = await llm.embedBatch(safe);
+        const embeddings: number[][] = [];
+        for (let i = 0; i < results.length; i++) {
+          const r = results[i];
+          if (!r) throw new Error(`in-process embedBatch returned null at index ${i}`);
+          embeddings.push(r.embedding);
+        }
+        if (!this.dimensions && embeddings[0]) {
+          this.dimensions = embeddings[0].length;
+        }
+        return embeddings;
+      }
       if (proto === "llama") {
         // llama-server speaks OpenAI /v1/embeddings.
         // model can be empty when only one model is loaded; we still pass-through
