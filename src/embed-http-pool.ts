@@ -21,6 +21,7 @@ import {
   insertEmbedding,
   clearAllEmbeddings,
 } from "./store.js";
+import { BackendLifecycle, loadBackendConfig } from "./embed-lifecycle.js";
 
 export type HttpEmbedConfig = {
   /** Backend server URLs (default: localhost:11434, override via QMD_EMBED_URLS or QMD_OLLAMA_URLS env) */
@@ -353,6 +354,9 @@ export class HttpEmbedPool {
   }
 
   getActiveUrls(): string[] { return this.activeUrls; }
+
+  /** Configured URLs, including unprobed ones. */
+  getConfiguredUrls(): string[] { return [...this.urls]; }
   getDimensions(): number { return this.dimensions; }
   getStats(): ServerStats[] { return Array.from(this.stats.values()); }
 
@@ -505,8 +509,17 @@ export async function generateEmbeddingsViaPool(
   // produce percent>100 → renderProgressBar throws on negative repeat().
   const totalBytes = allChunks.reduce((sum, c) => sum + c.bytes, 0);
 
-  // Pool probe + dimension discovery + vec0 table init.
+  // Lifecycle: bring up backends configured in ~/.config/qmd/embed-backends.yaml
+  // that aren't already reachable. Adopt the ones that are. Cleanup on exit.
+  const lifecycleConfig = loadBackendConfig();
+  const lifecycle = new BackendLifecycle();
   const pool = getDefaultEmbedPool();
+  if (lifecycleConfig) {
+    const urls = pool.getConfiguredUrls();
+    await lifecycle.prepare(urls, lifecycleConfig);
+  }
+
+  // Pool probe + dimension discovery + vec0 table init.
   await pool.embedBatch(["__probe__"]); // primes ensureActive() + dimensions
   const dims = pool.getDimensions();
   if (!dims) {
@@ -568,6 +581,9 @@ export async function generateEmbeddingsViaPool(
       errors,
     });
   }, SUB_BATCH);
+
+  // Stop any backends we started (adopted ones left alone).
+  await lifecycle.cleanup();
 
   return {
     docsProcessed: totalDocs,
