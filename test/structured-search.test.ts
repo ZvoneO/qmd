@@ -3,7 +3,7 @@
  *
  * Tests cover:
  * - CLI query parser (parseStructuredQuery)
- * - StructuredSubSearch type validation
+ * - ExpandedQuery type validation
  * - Basic structuredSearch function behavior
  *
  * Run with: bun test structured-search.test.ts
@@ -18,7 +18,7 @@ import {
   structuredSearch,
   validateSemanticQuery,
   validateLexQuery,
-  type StructuredSubSearch,
+  type ExpandedQuery,
   type Store,
 } from "../src/store.js";
 import { disposeDefaultLlamaCpp } from "../src/llm.js";
@@ -27,7 +27,7 @@ import { disposeDefaultLlamaCpp } from "../src/llm.js";
 // parseStructuredQuery Tests (CLI Parser)
 // =============================================================================
 
-function parseStructuredQuery(query: string): StructuredSubSearch[] | null {
+function parseStructuredQuery(query: string): ExpandedQuery[] | null {
   const rawLines = query.split('\n').map((line, idx) => ({
     raw: line,
     trimmed: line.trim(),
@@ -38,7 +38,7 @@ function parseStructuredQuery(query: string): StructuredSubSearch[] | null {
 
   const prefixRe = /^(lex|vec|hyde):\s*/i;
   const expandRe = /^expand:\s*/i;
-  const typed: StructuredSubSearch[] = [];
+  const typed: ExpandedQuery[] = [];
 
   for (const line of rawLines) {
     if (expandRe.test(line.trimmed)) {
@@ -253,24 +253,24 @@ describe("parseStructuredQuery", () => {
 });
 
 // =============================================================================
-// StructuredSubSearch Type Tests
+// ExpandedQuery Type Tests
 // =============================================================================
 
-describe("StructuredSubSearch type", () => {
+describe("ExpandedQuery type", () => {
   test("accepts lex type", () => {
-    const search: StructuredSubSearch = { type: "lex", query: "test" };
+    const search: ExpandedQuery = { type: "lex", query: "test" };
     expect(search.type).toBe("lex");
     expect(search.query).toBe("test");
   });
 
   test("accepts vec type", () => {
-    const search: StructuredSubSearch = { type: "vec", query: "test" };
+    const search: ExpandedQuery = { type: "vec", query: "test" };
     expect(search.type).toBe("vec");
     expect(search.query).toBe("test");
   });
 
   test("accepts hyde type", () => {
-    const search: StructuredSubSearch = { type: "hyde", query: "test" };
+    const search: ExpandedQuery = { type: "hyde", query: "test" };
     expect(search.type).toBe("hyde");
     expect(search.query).toBe("test");
   });
@@ -361,15 +361,71 @@ describe("lex query syntax", () => {
       expect(validateSemanticQuery("what is the CAP theorem")).toBeNull();
     });
 
-    test("rejects negation syntax", () => {
+    test("rejects negation at start of query", () => {
+      expect(validateSemanticQuery("-redis connection pooling")).toContain("Negation");
+    });
+
+    test("rejects negation after space", () => {
       expect(validateSemanticQuery("performance -sports")).toContain("Negation");
+    });
+
+    test("rejects negated quoted phrase", () => {
       expect(validateSemanticQuery('-"exact phrase"')).toContain("Negation");
     });
 
+    test("rejects multiple negations", () => {
+      expect(validateSemanticQuery("error handling -java -python")).toContain("Negation");
+    });
+
+    test("rejects negation after leading whitespace", () => {
+      expect(validateSemanticQuery("  -term at start")).toContain("Negation");
+    });
+
+    test("rejects negation after tab", () => {
+      expect(validateSemanticQuery("foo\t-bar")).toContain("Negation");
+    });
+
+    test("accepts hyphenated compound words", () => {
+      expect(validateSemanticQuery("long-lived server shared across clients")).toBeNull();
+      expect(validateSemanticQuery("real-time voice processing pipeline")).toBeNull();
+      expect(validateSemanticQuery("how does the rate-limiter handle burst traffic")).toBeNull();
+      expect(validateSemanticQuery("self-hosted deployment options")).toBeNull();
+      expect(validateSemanticQuery("multi-client session architecture")).toBeNull();
+      expect(validateSemanticQuery("cross-platform compatibility")).toBeNull();
+      expect(validateSemanticQuery("non-blocking I/O model")).toBeNull();
+      expect(validateSemanticQuery("in-memory caching strategy")).toBeNull();
+      expect(validateSemanticQuery("write-ahead log for crash recovery")).toBeNull();
+      expect(validateSemanticQuery("copy-on-write semantics")).toBeNull();
+    });
+
+    test("accepts multiple hyphens in a phrase", () => {
+      expect(validateSemanticQuery("state-of-the-art embedding models")).toBeNull();
+      expect(validateSemanticQuery("end-to-end testing")).toBeNull();
+      expect(validateSemanticQuery("man-in-the-middle attack prevention")).toBeNull();
+    });
+
+    test("accepts multiple hyphenated words in one query", () => {
+      expect(validateSemanticQuery("built-in vs add-on features")).toBeNull();
+    });
+
+    test("accepts short hyphenated terms", () => {
+      expect(validateSemanticQuery("A-B testing for ML models")).toBeNull();
+      expect(validateSemanticQuery("e-commerce platform")).toBeNull();
+    });
+
+    test("accepts bare hyphen without word character", () => {
+      expect(validateSemanticQuery("-")).toBeNull();
+    });
 
     test("accepts hyde-style hypothetical answers", () => {
       expect(validateSemanticQuery(
         "The CAP theorem states that a distributed system cannot simultaneously provide consistency, availability, and partition tolerance."
+      )).toBeNull();
+    });
+
+    test("accepts hyde with hyphenated words", () => {
+      expect(validateSemanticQuery(
+        "HTTP transport runs a single long-lived daemon shared across all clients, avoiding per-session model re-loading."
       )).toBeNull();
     });
   });
@@ -399,6 +455,14 @@ describe("buildFTS5Query (lex parser)", () => {
     return term.replace(/[^\p{L}\p{N}']/gu, '').toLowerCase();
   }
 
+  function isHyphenatedToken(token: string): boolean {
+    return /^[\p{L}\p{N}][\p{L}\p{N}'-]*-[\p{L}\p{N}][\p{L}\p{N}'-]*$/u.test(token);
+  }
+
+  function sanitizeHyphenatedTerm(term: string): string {
+    return term.split('-').map(t => sanitizeFTS5Term(t)).filter(t => t).join(' ');
+  }
+
   function buildFTS5Query(query: string): string | null {
     const positive: string[] = [];
     const negative: string[] = [];
@@ -424,8 +488,14 @@ describe("buildFTS5Query (lex parser)", () => {
         const start = i;
         while (i < s.length && !/[\s"]/.test(s[i]!)) i++;
         const term = s.slice(start, i);
-        const sanitized = sanitizeFTS5Term(term);
-        if (sanitized) (negated ? negative : positive).push(`"${sanitized}"*`);
+
+        if (isHyphenatedToken(term)) {
+          const sanitized = sanitizeHyphenatedTerm(term);
+          if (sanitized) (negated ? negative : positive).push(`"${sanitized}"`);
+        } else {
+          const sanitized = sanitizeFTS5Term(term);
+          if (sanitized) (negated ? negative : positive).push(`"${sanitized}"*`);
+        }
       }
     }
 
@@ -487,5 +557,38 @@ describe("buildFTS5Query (lex parser)", () => {
 
   test("special chars in terms stripped", () => {
     expect(buildFTS5Query("hello!world")).toBe('"helloworld"*');
+  });
+
+  // Hyphenated token tests
+  test("hyphenated term → phrase match", () => {
+    expect(buildFTS5Query("multi-agent")).toBe('"multi agent"');
+  });
+
+  test("hyphenated identifier → phrase match", () => {
+    expect(buildFTS5Query("DEC-0054")).toBe('"dec 0054"');
+  });
+
+  test("hyphenated model name → phrase match", () => {
+    expect(buildFTS5Query("gpt-4")).toBe('"gpt 4"');
+  });
+
+  test("multi-hyphen term → phrase match", () => {
+    expect(buildFTS5Query("foo-bar-baz")).toBe('"foo bar baz"');
+  });
+
+  test("hyphenated term mixed with plain terms", () => {
+    expect(buildFTS5Query("multi-agent memory")).toBe('"multi agent" AND "memory"*');
+  });
+
+  test("negation still works alongside hyphenated terms", () => {
+    expect(buildFTS5Query("multi-agent -sports")).toBe('"multi agent" NOT "sports"*');
+  });
+
+  test("negated hyphenated term", () => {
+    expect(buildFTS5Query("performance -multi-agent")).toBe('"performance"* NOT "multi agent"');
+  });
+
+  test("plain negation still works (not confused with hyphen)", () => {
+    expect(buildFTS5Query("performance -sports")).toBe('"performance"* NOT "sports"*');
   });
 });

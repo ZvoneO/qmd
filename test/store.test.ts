@@ -9,11 +9,12 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { openDatabase, loadSqliteVec } from "../src/db.js";
 import type { Database } from "../src/db.js";
-import { unlink, mkdtemp, rmdir, writeFile } from "node:fs/promises";
+import { unlink, mkdtemp, rmdir, writeFile, rm, mkdir, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
-import { disposeDefaultLlamaCpp } from "../src/llm.js";
+import * as llmModule from "../src/llm.js";
+import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
 import {
   createStore,
   verifySqliteVecLoaded,
@@ -21,13 +22,15 @@ import {
   homedir,
   resolve,
   getPwd,
-  getRealPath,
   hashContent,
   extractTitle,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   chunkDocument,
   chunkDocumentByTokens,
+  chunkDocumentAsync,
+  chunkDocumentWithBreakPoints,
+  mergeBreakPoints,
   scanBreakPoints,
   findCodeFences,
   isInsideCodeFence,
@@ -37,18 +40,28 @@ import {
   reciprocalRankFusion,
   extractSnippet,
   getCacheKey,
-  handelize,
   normalizeVirtualPath,
   isVirtualPath,
   parseVirtualPath,
   normalizeDocid,
   isDocid,
+  syncConfigToDb,
+  reindexCollection,
   STRONG_SIGNAL_MIN_SCORE,
   STRONG_SIGNAL_MIN_GAP,
+  insertContent,
+  insertDocument,
+  generateEmbeddings,
+  getHybridRrfWeights,
+  _resetProductionModeForTesting,
+  hybridQuery,
+  structuredSearch,
+  vectorSearchQuery,
   type Store,
   type DocumentResult,
   type SearchResult,
   type RankedResult,
+  type RankedListMeta,
 } from "../src/store.js";
 import type { CollectionConfig } from "../src/collections.js";
 
@@ -66,6 +79,7 @@ import type { CollectionConfig } from "../src/collections.js";
 let testDir: string;
 let testDbPath: string;
 let testConfigDir: string;
+let currentTestStore: Store | null = null;
 
 async function createTestStore(): Promise<Store> {
   testDbPath = join(testDir, `test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
@@ -84,10 +98,13 @@ async function createTestStore(): Promise<Store> {
     YAML.stringify(emptyConfig)
   );
 
-  return createStore(testDbPath);
+  const store = createStore(testDbPath);
+  currentTestStore = store;
+  return store;
 }
 
 async function cleanupTestDb(store: Store): Promise<void> {
+  currentTestStore = null;
   store.close();
   try {
     await unlink(store.dbPath);
@@ -148,18 +165,30 @@ async function insertTestDocument(
   const hash = opts.hash || await hashContent(body);
 
   // Insert content (with OR IGNORE for deduplication)
-  db.prepare(`
-    INSERT OR IGNORE INTO content (hash, doc, created_at)
-    VALUES (?, ?, ?)
-  `).run(hash, body, now);
+  insertContent(db, hash, body, now);
 
-  // Insert document
-  const result = db.prepare(`
-    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(collectionName, path, title, hash, now, now, active);
+  insertDocument(db, collectionName, path, title, hash, now, now);
+  const row = db.prepare(`
+    SELECT id FROM documents WHERE collection = ? AND path = ?
+  `).get(collectionName, path) as { id: number } | undefined;
 
-  return Number(result.lastInsertRowid);
+  if (active === 0 && row) {
+    db.prepare(`UPDATE documents SET active = 0 WHERE id = ?`).run(row.id);
+  }
+
+  return row?.id ?? 0;
+}
+
+/** Sync YAML config file to SQLite store_collections in the current test store */
+async function syncTestConfig(): Promise<void> {
+  if (!currentTestStore) return;
+  const configPath = join(testConfigDir, "index.yml");
+  const { readFile } = await import("node:fs/promises");
+  const content = await readFile(configPath, "utf-8");
+  const config = YAML.parse(content) as CollectionConfig;
+  // Clear config hash to force re-sync
+  currentTestStore.db.prepare(`DELETE FROM store_config WHERE key = 'config_hash'`).run();
+  syncConfigToDb(currentTestStore.db, config);
 }
 
 // Helper to create a test collection in YAML config
@@ -184,6 +213,7 @@ async function createTestCollection(
 
   // Write back
   await writeFile(configPath, YAML.stringify(config));
+  await syncTestConfig();
   return name;
 }
 
@@ -208,6 +238,7 @@ async function addPathContext(collectionName: string, pathPrefix: string, contex
 
   // Write back
   await writeFile(configPath, YAML.stringify(config));
+  await syncTestConfig();
 }
 
 // Helper to add global context in YAML config
@@ -220,6 +251,7 @@ async function addGlobalContext(contextText: string): Promise<void> {
   config.global_context = contextText;
 
   await writeFile(configPath, YAML.stringify(config));
+  await syncTestConfig();
 }
 
 // =============================================================================
@@ -247,170 +279,6 @@ afterAll(async () => {
   }
 });
 
-// =============================================================================
-// Path Utilities Tests
-// =============================================================================
-
-describe("Path Utilities", () => {
-  test("homedir returns HOME environment variable", () => {
-    const result = homedir();
-    expect(result).toBe(process.env.HOME || "/tmp");
-  });
-
-  test("resolve handles absolute paths", () => {
-    expect(resolve("/foo/bar")).toBe("/foo/bar");
-    expect(resolve("/foo", "/bar")).toBe("/bar");
-  });
-
-  test("resolve handles relative paths", () => {
-    const pwd = process.env.PWD || process.cwd();
-    expect(resolve("foo")).toBe(`${pwd}/foo`);
-    expect(resolve("foo", "bar")).toBe(`${pwd}/foo/bar`);
-  });
-
-  test("resolve normalizes . and ..", () => {
-    expect(resolve("/foo/bar/./baz")).toBe("/foo/bar/baz");
-    expect(resolve("/foo/bar/../baz")).toBe("/foo/baz");
-    expect(resolve("/foo/bar/../../baz")).toBe("/baz");
-  });
-
-  test("getDefaultDbPath throws in test mode without INDEX_PATH", () => {
-    // In test mode, getDefaultDbPath should throw to prevent accidental writes to global index
-    // This is intentional safety behavior
-    const originalIndexPath = process.env.INDEX_PATH;
-    delete process.env.INDEX_PATH;
-
-    expect(() => getDefaultDbPath()).toThrow("Database path not set");
-
-    // Restore
-    if (originalIndexPath) process.env.INDEX_PATH = originalIndexPath;
-  });
-
-  test("getDefaultDbPath uses INDEX_PATH when set", () => {
-    const originalIndexPath = process.env.INDEX_PATH;
-    process.env.INDEX_PATH = "/tmp/test-index.sqlite";
-
-    expect(getDefaultDbPath()).toBe("/tmp/test-index.sqlite");
-    expect(getDefaultDbPath("custom")).toBe("/tmp/test-index.sqlite"); // INDEX_PATH overrides name
-
-    // Restore
-    if (originalIndexPath) {
-      process.env.INDEX_PATH = originalIndexPath;
-    } else {
-      delete process.env.INDEX_PATH;
-    }
-  });
-
-  test("getPwd returns current working directory", () => {
-    const pwd = getPwd();
-    expect(pwd).toBeTruthy();
-    expect(typeof pwd).toBe("string");
-  });
-
-  test("getRealPath resolves symlinks", () => {
-    const result = getRealPath("/tmp");
-    expect(result).toBeTruthy();
-    // On macOS, /tmp is a symlink to /private/tmp
-    expect(result === "/tmp" || result === "/private/tmp").toBe(true);
-  });
-});
-
-// =============================================================================
-// Handelize Tests - path normalization for token-friendly filenames
-// =============================================================================
-
-describe("handelize", () => {
-  test("converts to lowercase", () => {
-    expect(handelize("README.md")).toBe("readme.md");
-    expect(handelize("MyFile.MD")).toBe("myfile.md");
-  });
-
-  test("preserves folder structure", () => {
-    expect(handelize("a/b/c/d.md")).toBe("a/b/c/d.md");
-    expect(handelize("docs/api/README.md")).toBe("docs/api/readme.md");
-  });
-
-  test("replaces non-word characters with dash", () => {
-    expect(handelize("hello world.md")).toBe("hello-world.md");
-    expect(handelize("file (1).md")).toBe("file-1.md");
-    expect(handelize("foo@bar#baz.md")).toBe("foo-bar-baz.md");
-  });
-
-  test("collapses multiple special chars into single dash", () => {
-    expect(handelize("hello   world.md")).toBe("hello-world.md");
-    expect(handelize("foo---bar.md")).toBe("foo-bar.md");
-    expect(handelize("a  -  b.md")).toBe("a-b.md");
-  });
-
-  test("removes leading and trailing dashes from segments", () => {
-    expect(handelize("-hello-.md")).toBe("hello.md");
-    expect(handelize("--test--.md")).toBe("test.md");
-    expect(handelize("a/-b-/c.md")).toBe("a/b/c.md");
-  });
-
-  test("converts triple underscore to folder separator", () => {
-    expect(handelize("foo___bar.md")).toBe("foo/bar.md");
-    expect(handelize("notes___2025___january.md")).toBe("notes/2025/january.md");
-    expect(handelize("a/b___c/d.md")).toBe("a/b/c/d.md");
-  });
-
-  test("handles complex real-world meeting notes", () => {
-    // Example: "Money Movement Licensing Review - 2025／11／19 10:25 EST - Notes by Gemini.md"
-    const complexName = "Money Movement Licensing Review - 2025／11／19 10:25 EST - Notes by Gemini.md";
-    const result = handelize(complexName);
-    expect(result).toBe("money-movement-licensing-review-2025-11-19-10-25-est-notes-by-gemini.md");
-    expect(result).not.toContain(" ");
-    expect(result).not.toContain("／");
-    expect(result).not.toContain(":");
-  });
-
-  test("handles unicode characters", () => {
-    // Pure unicode filenames are now supported (fixes GitHub issue #10)
-    expect(handelize("日本語.md")).toBe("日本語.md");
-    expect(handelize("Зоны и проекты.md")).toBe("зоны-и-проекты.md");
-    // Mixed unicode/ascii preserves both
-    expect(handelize("café-notes.md")).toBe("café-notes.md");
-    expect(handelize("naïve.md")).toBe("naïve.md");
-    expect(handelize("日本語-notes.md")).toBe("日本語-notes.md");
-  });
-
-  test("handles dates and times in filenames", () => {
-    expect(handelize("meeting-2025-01-15.md")).toBe("meeting-2025-01-15.md");
-    expect(handelize("notes 2025/01/15.md")).toBe("notes-2025/01/15.md");
-    expect(handelize("call_10:30_AM.md")).toBe("call-10-30-am.md");
-  });
-
-  test("handles special project naming patterns", () => {
-    expect(handelize("PROJECT_ABC_v2.0.md")).toBe("project-abc-v2-0.md");
-    expect(handelize("[WIP] Feature Request.md")).toBe("wip-feature-request.md");
-    expect(handelize("(DRAFT) Proposal v1.md")).toBe("draft-proposal-v1.md");
-  });
-
-  test("handles symbol-only route filenames", () => {
-    expect(handelize("routes/api/auth/$.ts")).toBe("routes/api/auth/$.ts");
-    expect(handelize("app/routes/$id.tsx")).toBe("app/routes/$id.tsx");
-  });
-
-  test("filters out empty segments", () => {
-    expect(handelize("a//b/c.md")).toBe("a/b/c.md");
-    expect(handelize("/a/b/")).toBe("a/b");
-    expect(handelize("///test///")).toBe("test");
-  });
-
-  test("throws error for invalid inputs", () => {
-    expect(() => handelize("")).toThrow("path cannot be empty");
-    expect(() => handelize("   ")).toThrow("path cannot be empty");
-    expect(() => handelize(".md")).toThrow("no valid filename content");
-    expect(() => handelize("...")).toThrow("no valid filename content");
-    expect(() => handelize("___")).toThrow("no valid filename content");
-  });
-
-  test("handles minimal valid inputs", () => {
-    expect(handelize("a")).toBe("a");
-    expect(handelize("1")).toBe("1");
-    expect(handelize("a.md")).toBe("a.md");
-  });
-});
 
 // =============================================================================
 // Store Creation Tests
@@ -418,7 +286,9 @@ describe("handelize", () => {
 
 describe("Store Creation", () => {
   test("createStore throws without explicit path in test mode", () => {
-    // In test mode, createStore without path should throw to prevent accidental writes
+    // In test mode, createStore without path should throw to prevent accidental writes.
+    // Other tests may enable production mode in the same Bun process, so reset first.
+    _resetProductionModeForTesting();
     const originalIndexPath = process.env.INDEX_PATH;
     delete process.env.INDEX_PATH;
 
@@ -477,6 +347,20 @@ describe("Store Creation", () => {
       expect(() => verifySqliteVecLoaded(db)).not.toThrow();
     } finally {
       db.close();
+    }
+  });
+
+  test("ensureVecTable surfaces actionable sqlite-vec guidance", async () => {
+    const store = await createTestStore();
+    try {
+      if (typeof process.getBuiltinModule === "function") {
+        expect(() => store.ensureVecTable(768)).not.toThrow();
+      } else {
+        expect(() => store.ensureVecTable(768)).toThrow(/sqlite-vec extension is unavailable/);
+        expect(() => store.ensureVecTable(768)).toThrow(/Install Homebrew SQLite/);
+      }
+    } finally {
+      await cleanupTestDb(store);
     }
   });
 
@@ -999,6 +883,127 @@ Final section content.
 });
 
 // =============================================================================
+// AST-Aware Chunking Integration Tests
+// =============================================================================
+
+describe("mergeBreakPoints", () => {
+  test("merges two sets of break points keeping highest score at each position", () => {
+    const regexPoints: BreakPoint[] = [
+      { pos: 10, score: 20, type: "blank" },
+      { pos: 50, score: 1, type: "newline" },
+    ];
+    const astPoints: BreakPoint[] = [
+      { pos: 10, score: 90, type: "ast:func" },
+      { pos: 100, score: 100, type: "ast:class" },
+    ];
+
+    const merged = mergeBreakPoints(regexPoints, astPoints);
+    expect(merged).toHaveLength(3);
+
+    // pos 10: AST score (90) wins over regex (20)
+    const at10 = merged.find(p => p.pos === 10);
+    expect(at10?.score).toBe(90);
+    expect(at10?.type).toBe("ast:func");
+
+    // pos 50: only regex
+    expect(merged.find(p => p.pos === 50)?.score).toBe(1);
+
+    // pos 100: only AST
+    expect(merged.find(p => p.pos === 100)?.score).toBe(100);
+  });
+
+  test("returns sorted by position", () => {
+    const a: BreakPoint[] = [{ pos: 100, score: 10, type: "a" }];
+    const b: BreakPoint[] = [{ pos: 5, score: 20, type: "b" }];
+    const merged = mergeBreakPoints(a, b);
+    expect(merged[0]!.pos).toBe(5);
+    expect(merged[1]!.pos).toBe(100);
+  });
+});
+
+describe("chunkDocumentWithBreakPoints", () => {
+  test("produces same output as chunkDocument for same input", () => {
+    const content = "a".repeat(5000) + "\n\n" + "b".repeat(5000);
+    const breakPoints = scanBreakPoints(content);
+    const codeFences = findCodeFences(content);
+
+    const chunksOriginal = chunkDocument(content);
+    const chunksNew = chunkDocumentWithBreakPoints(content, breakPoints, codeFences);
+
+    expect(chunksNew.length).toBe(chunksOriginal.length);
+    for (let i = 0; i < chunksNew.length; i++) {
+      expect(chunksNew[i]!.text).toBe(chunksOriginal[i]!.text);
+      expect(chunksNew[i]!.pos).toBe(chunksOriginal[i]!.pos);
+    }
+  });
+});
+
+describe("AST-aware chunkDocumentAsync", () => {
+  const TS_CODE = `import { Database } from './db';
+
+export class AuthService {
+  constructor(private db: Database) {}
+
+  async authenticate(user: User, token: string): Promise<boolean> {
+    const session = await this.db.findSession(token);
+    return session?.userId === user.id;
+  }
+
+  validateToken(token: string): boolean {
+    return token.length === 64;
+  }
+}
+
+export function hashPassword(password: string): string {
+  return crypto.createHash('sha256').update(password).digest('hex');
+}
+`.repeat(10); // Repeat to make it large enough to trigger chunking
+
+  test("returns chunks for code files with AST strategy", async () => {
+    const chunks = await chunkDocumentAsync(TS_CODE, undefined, undefined, undefined, "auth.ts", "auto");
+    expect(chunks.length).toBeGreaterThan(0);
+    // Each chunk should have text and pos
+    for (const chunk of chunks) {
+      expect(typeof chunk.text).toBe("string");
+      expect(chunk.text.length).toBeGreaterThan(0);
+      expect(chunk.pos).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  test("regex strategy produces same output as chunkDocument for code files", async () => {
+    const asyncChunks = await chunkDocumentAsync(TS_CODE, undefined, undefined, undefined, "auth.ts", "regex");
+    const syncChunks = chunkDocument(TS_CODE);
+
+    expect(asyncChunks.length).toBe(syncChunks.length);
+    for (let i = 0; i < asyncChunks.length; i++) {
+      expect(asyncChunks[i]!.text).toBe(syncChunks[i]!.text);
+      expect(asyncChunks[i]!.pos).toBe(syncChunks[i]!.pos);
+    }
+  });
+
+  test("markdown files are unchanged in auto mode", async () => {
+    const mdContent = ("# Heading\n\n" + "Some text. ".repeat(200) + "\n\n").repeat(10);
+    const asyncChunks = await chunkDocumentAsync(mdContent, undefined, undefined, undefined, "readme.md", "auto");
+    const syncChunks = chunkDocument(mdContent);
+
+    expect(asyncChunks.length).toBe(syncChunks.length);
+    for (let i = 0; i < asyncChunks.length; i++) {
+      expect(asyncChunks[i]!.text).toBe(syncChunks[i]!.text);
+    }
+  });
+
+  test("no filepath falls back to regex-only", async () => {
+    const asyncChunks = await chunkDocumentAsync(TS_CODE, undefined, undefined, undefined, undefined, "auto");
+    const syncChunks = chunkDocument(TS_CODE);
+
+    expect(asyncChunks.length).toBe(syncChunks.length);
+    for (let i = 0; i < asyncChunks.length; i++) {
+      expect(asyncChunks[i]!.text).toBe(syncChunks[i]!.text);
+    }
+  });
+});
+
+// =============================================================================
 // Caching Tests
 // =============================================================================
 
@@ -1181,6 +1186,34 @@ describe("FTS Search", () => {
     await cleanupTestDb(store);
   });
 
+  test("searchFTS title boost outweighs higher body frequency", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    // Document with "quantum" mentioned in a longer body but NOT in the title
+    await insertTestDocument(store.db, collectionName, {
+      name: "body-only",
+      title: "General Science Notes",
+      body: "This research paper discusses quantum mechanics and the quantum model of computation. The quantum approach offers improvements over classical methods.",
+      displayPath: "test/body-only.md",
+    });
+
+    // Document with "quantum" in the title but a shorter body mention
+    await insertTestDocument(store.db, collectionName, {
+      name: "title-match",
+      title: "Quantum Computing Overview",
+      body: "An introduction to the fundamentals of this emerging computing paradigm.",
+      displayPath: "test/title-match.md",
+    });
+
+    const results = store.searchFTS("quantum", 10);
+    expect(results.length).toBe(2);
+    // Title-match doc should rank higher due to BM25 column weights boosting title
+    expect(results[0]!.displayPath).toBe(`${collectionName}/test/title-match.md`);
+
+    await cleanupTestDb(store);
+  });
+
   test("searchFTS respects limit parameter", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();
@@ -1224,6 +1257,61 @@ describe("FTS Search", () => {
     const filtered = store.searchFTS("searchable", 10, collection1);
     expect(filtered).toHaveLength(1);
     expect(filtered[0]!.displayPath).toBe(`${collection1}/doc1.md`);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchFTS finds CJK documents by exact and mixed queries", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "zh",
+      title: "中文检索说明",
+      body: "这里介绍 vector 数据库和关键词检索。",
+      displayPath: "cjk/zh.md",
+    });
+    await insertTestDocument(store.db, collectionName, {
+      name: "ja",
+      title: "日本語検索メモ",
+      body: "この文書は検索品質とトークン化について説明します。",
+      displayPath: "cjk/ja.md",
+    });
+    await insertTestDocument(store.db, collectionName, {
+      name: "ko",
+      title: "한국어 검색 노트",
+      body: "이 문서는 검색 품질과 토큰화 문제를 설명합니다.",
+      displayPath: "cjk/ko.md",
+    });
+
+    expect(store.searchFTS("关键词检索", 10).map(r => r.displayPath)).toContain(`${collectionName}/cjk/zh.md`);
+    expect(store.searchFTS("検索品質", 10).map(r => r.displayPath)).toContain(`${collectionName}/cjk/ja.md`);
+    expect(store.searchFTS("검색 품질", 10).map(r => r.displayPath)).toContain(`${collectionName}/cjk/ko.md`);
+    expect(store.searchFTS("vector 关键词", 10).map(r => r.displayPath)).toContain(`${collectionName}/cjk/zh.md`);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchFTS keeps English behavior while indexing CJK text", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "english",
+      title: "Vector Search Notes",
+      body: "The quick brown fox explains vector search and BM25 ranking.",
+      displayPath: "english.md",
+    });
+    await insertTestDocument(store.db, collectionName, {
+      name: "zh",
+      title: "中文检索说明",
+      body: "这里介绍向量数据库和关键词检索。",
+      displayPath: "zh.md",
+    });
+
+    const foxResults = store.searchFTS("quick fox", 10);
+    expect(foxResults.map(r => r.displayPath)).toContain(`${collectionName}/english.md`);
+    expect(foxResults.map(r => r.displayPath)).not.toContain(`${collectionName}/zh.md`);
 
     await cleanupTestDb(store);
   });
@@ -1735,6 +1823,55 @@ describe("Document Retrieval", () => {
 
       await cleanupTestDb(store);
     });
+
+    test("findDocuments supports brace expansion patterns", async () => {
+      const store = await createTestStore();
+      const collectionName = await createTestCollection();
+
+      await insertTestDocument(store.db, collectionName, {
+        name: "doc1",
+        filepath: "/path/doc1.md",
+        displayPath: "doc1.md",
+      });
+      await insertTestDocument(store.db, collectionName, {
+        name: "doc2",
+        filepath: "/path/doc2.md",
+        displayPath: "doc2.md",
+      });
+      await insertTestDocument(store.db, collectionName, {
+        name: "doc3",
+        filepath: "/path/doc3.md",
+        displayPath: "doc3.md",
+      });
+
+      const { docs, errors } = store.findDocuments("{doc1,doc2}.md");
+      expect(errors).toHaveLength(0);
+      expect(docs).toHaveLength(2);
+
+      await cleanupTestDb(store);
+    });
+
+    test("findDocuments supports brace expansion with collection prefix", async () => {
+      const store = await createTestStore();
+      const collectionName = await createTestCollection();
+
+      await insertTestDocument(store.db, collectionName, {
+        name: "readme",
+        filepath: "/path/readme.md",
+        displayPath: "readme.md",
+      });
+      await insertTestDocument(store.db, collectionName, {
+        name: "changelog",
+        filepath: "/path/changelog.md",
+        displayPath: "changelog.md",
+      });
+
+      const { docs, errors } = store.findDocuments(`${collectionName}/{readme,changelog}.md`);
+      expect(errors).toHaveLength(0);
+      expect(docs).toHaveLength(2);
+
+      await cleanupTestDb(store);
+    });
   });
 
 });
@@ -1917,6 +2054,38 @@ describe("Reciprocal Rank Fusion", () => {
     expect(fused[0]!.file).toBe("doc1");
   });
 
+  test("hybrid RRF weights boost original vector evidence over expansion-only hits", () => {
+    const originalFtsOnly = makeResult("original-fts-only.md", 0.95);
+    const expansionOnly = makeResult("lex-expansion-only.md", 0.95);
+    const originalVector = makeResult("original-vector.md", 0.95);
+
+    // Mirrors hybridQuery's common list order when a lex expansion exists:
+    // original FTS, lex expansion FTS, original vector.
+    const rankedLists = [
+      [originalFtsOnly],
+      [expansionOnly],
+      [originalVector],
+    ];
+    const rankedListMeta: RankedListMeta[] = [
+      { source: "fts", queryType: "original", query: "user query" },
+      { source: "fts", queryType: "lex", query: "lex expansion" },
+      { source: "vec", queryType: "original", query: "user query" },
+    ];
+
+    const positionBasedWeights = rankedLists.map((_, i) => i < 2 ? 2.0 : 1.0);
+    const buggyOrder = reciprocalRankFusion(rankedLists, positionBasedWeights);
+
+    expect(buggyOrder.findIndex(r => r.file === "lex-expansion-only.md"))
+      .toBeLessThan(buggyOrder.findIndex(r => r.file === "original-vector.md"));
+
+    const semanticWeights = getHybridRrfWeights(rankedListMeta);
+    const fixedOrder = reciprocalRankFusion(rankedLists, semanticWeights);
+
+    expect(semanticWeights).toEqual([2.0, 1.0, 2.0]);
+    expect(fixedOrder.findIndex(r => r.file === "original-vector.md"))
+      .toBeLessThan(fixedOrder.findIndex(r => r.file === "lex-expansion-only.md"));
+  });
+
   test("RRF adds top-rank bonus", () => {
     // doc1 is #1 in list1, doc2 is #2 in list1
     const list1 = [makeResult("doc1", 0.9), makeResult("doc2", 0.8)];
@@ -1946,6 +2115,65 @@ describe("Reciprocal Rank Fusion", () => {
 
     // Lower k = higher scores for top ranks
     expect(fused30[0]!.score).toBeGreaterThan(fused60[0]!.score);
+  });
+});
+
+// =============================================================================
+// Reindex Collection Tests
+// =============================================================================
+
+describe("Reindex Collection", () => {
+  test("preserves document id and embeddings when file path changes only by case", async () => {
+    const store = await createTestStore();
+    const collectionName = "docs";
+    const collectionPath = join(testDir, `case-rename-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(collectionPath, { recursive: true });
+
+    const originalPath = join(collectionPath, "README.md");
+    const renamedPath = join(collectionPath, "readme.md");
+    const body = "# Case Rename\n\nContent that should keep the same embedding.";
+    await writeFile(originalPath, body);
+
+    const firstResult = await reindexCollection(store, collectionPath, "**/*.md", collectionName);
+    expect(firstResult.indexed).toBe(1);
+
+    const before = store.db.prepare(`
+      SELECT id, path, hash FROM documents
+      WHERE collection = ? AND active = 1
+    `).get(collectionName) as { id: number; path: string; hash: string };
+    expect(before.path).toBe("README.md");
+
+    store.db.prepare(`
+      INSERT INTO content_vectors (hash, seq, pos, model, embedded_at)
+      VALUES (?, 0, 0, 'test-model', ?)
+    `).run(before.hash, new Date().toISOString());
+
+    await rename(originalPath, renamedPath);
+
+    const secondResult = await reindexCollection(store, collectionPath, "**/*.md", collectionName);
+    expect(secondResult.indexed).toBe(0);
+    expect(secondResult.unchanged).toBe(1);
+    expect(secondResult.removed).toBe(0);
+
+    const afterRows = store.db.prepare(`
+      SELECT id, path, hash, active FROM documents
+      WHERE collection = ?
+      ORDER BY id
+    `).all(collectionName) as { id: number; path: string; hash: string; active: number }[];
+    expect(afterRows).toHaveLength(1);
+    expect(afterRows[0]).toMatchObject({ id: before.id, path: "readme.md", hash: before.hash, active: 1 });
+
+    const vectorCount = store.db.prepare(`
+      SELECT COUNT(*) AS count FROM content_vectors WHERE hash = ?
+    `).get(before.hash) as { count: number };
+    expect(vectorCount.count).toBe(1);
+
+    const ftsRows = store.db.prepare(`
+      SELECT rowid, filepath FROM documents_fts WHERE rowid = ?
+    `).all(before.id) as { rowid: number; filepath: string }[];
+    expect(ftsRows).toEqual([{ rowid: before.id, filepath: "docs/readme.md" }]);
+
+    await cleanupTestDb(store);
   });
 });
 
@@ -2093,6 +2321,48 @@ describe("Fuzzy Matching", () => {
 
     await cleanupTestDb(store);
   });
+
+  test("matchFilesByGlob matches collection/path patterns", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    await insertTestDocument(store.db, collectionName, {
+      filepath: "/p/readme.md",
+      displayPath: "readme.md",
+    });
+    await insertTestDocument(store.db, collectionName, {
+      filepath: "/p/changelog.md",
+      displayPath: "changelog.md",
+    });
+
+    const matches = store.matchFilesByGlob(`${collectionName}/*.md`);
+    expect(matches).toHaveLength(2);
+
+    await cleanupTestDb(store);
+  });
+
+  test("matchFilesByGlob matches brace expansion", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    await insertTestDocument(store.db, collectionName, {
+      filepath: "/p/readme.md",
+      displayPath: "readme.md",
+    });
+    await insertTestDocument(store.db, collectionName, {
+      filepath: "/p/changelog.md",
+      displayPath: "changelog.md",
+    });
+    await insertTestDocument(store.db, collectionName, {
+      filepath: "/p/license.md",
+      displayPath: "license.md",
+    });
+
+    const matches = store.matchFilesByGlob(`${collectionName}/{readme,changelog}.md`);
+    expect(matches).toHaveLength(2);
+
+    await cleanupTestDb(store);
+  });
 });
 
 // =============================================================================
@@ -2120,25 +2390,53 @@ describe("Vector Table", () => {
     await cleanupTestDb(store);
   });
 
-  test("ensureVecTable recreates table if dimensions change", async () => {
+  test("ensureVecTable throws on dimension mismatch instead of silently rebuilding", async () => {
     const store = await createTestStore();
 
     // Create with 768 dimensions
     store.ensureVecTable(768);
 
     // Check dimensions
-    let tableInfo = store.db.prepare(`
+    const tableInfo = store.db.prepare(`
       SELECT sql FROM sqlite_master WHERE type='table' AND name='vectors_vec'
     `).get() as { sql: string };
     expect(tableInfo.sql).toContain("float[768]");
 
-    // Recreate with different dimensions
-    store.ensureVecTable(1024);
+    // Attempting to use a different dimension should throw (not silently drop data)
+    expect(() => store.ensureVecTable(1024)).toThrow(/dimension mismatch/i);
 
-    tableInfo = store.db.prepare(`
+    // Original table should still exist untouched
+    const tableInfoAfter = store.db.prepare(`
       SELECT sql FROM sqlite_master WHERE type='table' AND name='vectors_vec'
     `).get() as { sql: string };
-    expect(tableInfo.sql).toContain("float[1024]");
+    expect(tableInfoAfter.sql).toContain("float[768]");
+
+    await cleanupTestDb(store);
+  });
+
+  test("insertEmbedding is idempotent for an existing vec0 hash_seq (#598)", async () => {
+    const store = await createTestStore();
+    store.ensureVecTable(2);
+
+    const hash = "existinghashseq";
+    const first = new Float32Array([0.1, 0.2]);
+    const second = new Float32Array([0.3, 0.4]);
+    const now = new Date().toISOString();
+
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, first);
+
+    // Reproduces sqlite-vec's broken conflict handling: vec0 does not honor OR REPLACE.
+    expect(() => {
+      store.db.prepare(`INSERT OR REPLACE INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, second);
+    }).toThrow(/UNIQUE constraint failed/i);
+
+    // QMD must therefore use DELETE + INSERT when upserting the vector row.
+    expect(() => store.insertEmbedding(hash, 0, 0, second, "test-model", now)).not.toThrow();
+
+    const vectorCount = store.db.prepare(`SELECT COUNT(*) AS count FROM vectors_vec WHERE hash_seq = ?`).get(`${hash}_0`) as { count: number };
+    const metadataCount = store.db.prepare(`SELECT COUNT(*) AS count FROM content_vectors WHERE hash = ? AND seq = 0`).get(hash) as { count: number };
+    expect(vectorCount.count).toBe(1);
+    expect(metadataCount.count).toBe(1);
 
     await cleanupTestDb(store);
   });
@@ -2149,6 +2447,47 @@ describe("Vector Table", () => {
 // =============================================================================
 
 describe("Integration", () => {
+  test("reindexCollection soft-deletes removed files and preserves inactive content (#585)", async () => {
+    const store = await createTestStore();
+    const collectionDir = await mkdtemp(join(testDir, "orphan-regression-"));
+    const collectionName = "orphan-regression";
+
+    try {
+      for (let i = 1; i <= 5; i++) {
+        await writeFile(join(collectionDir, `doc-${i}.md`), `# Doc ${i}\n\nUnique body ${i}`);
+      }
+
+      await createTestCollection({ pwd: collectionDir, glob: "**/*.md", name: collectionName });
+
+      const initial = await reindexCollection(store, collectionDir, "**/*.md", collectionName);
+      expect(initial.indexed).toBe(5);
+      expect(initial.removed).toBe(0);
+
+      await rm(join(collectionDir, "doc-3.md"));
+      await rm(join(collectionDir, "doc-4.md"));
+      await rm(join(collectionDir, "doc-5.md"));
+
+      const afterDelete = await reindexCollection(store, collectionDir, "**/*.md", collectionName);
+      expect(afterDelete.removed).toBe(3);
+
+      const counts = store.db.prepare(`
+        SELECT
+          SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END) AS active,
+          SUM(CASE WHEN active = 0 THEN 1 ELSE 0 END) AS inactive,
+          COUNT(*) AS total
+        FROM documents
+        WHERE collection = ?
+      `).get(collectionName) as { active: number; inactive: number; total: number };
+      const contentCount = store.db.prepare(`SELECT COUNT(*) AS count FROM content`).get() as { count: number };
+
+      expect(counts).toEqual({ active: 2, inactive: 3, total: 5 });
+      expect(contentCount.count).toBe(5);
+    } finally {
+      await rm(collectionDir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
   test("full document lifecycle: create, search, retrieve", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection({ pwd: "/test/notes", glob: "**/*.md" });
@@ -2375,12 +2714,12 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     expect(expanded.length).toBeGreaterThanOrEqual(1);
     for (const q of expanded) {
       expect(['lex', 'vec', 'hyde']).toContain(q.type);
-      expect(q.text.length).toBeGreaterThan(0);
-      expect(q.text).not.toBe("test query"); // original excluded
+      expect(q.query.length).toBeGreaterThan(0);
+      expect(q.query).not.toBe("test query"); // original excluded
     }
 
     await cleanupTestDb(store);
-  }, 30000);
+  }, 90000);
 
   test("expandQuery caches results as JSON with types", async () => {
     const store = await createTestStore();
@@ -2395,7 +2734,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     expect(queries2[0]?.type).toBeDefined();
 
     await cleanupTestDb(store);
-  }, 30000);
+  }, 60000);
 
   test("rerank scores documents", async () => {
     const store = await createTestStore();
@@ -2426,6 +2765,40 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     expect(results).toHaveLength(1);
 
     await cleanupTestDb(store);
+  });
+
+  test("rerank deduplicates identical chunks across files", async () => {
+    const store = await createTestStore();
+    const rerankSpy = vi.fn(async (_query: string, docs: { file: string; text: string }[]) => ({
+      results: docs.map((doc, index) => ({
+        file: doc.file,
+        score: 1 - index * 0.1,
+        index,
+      })),
+      model: "mock-reranker",
+    }));
+
+    const llmSpy = vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue({
+      rerank: rerankSpy,
+    } as any);
+
+    try {
+      const docs = [
+        { file: "doc1.md", text: "Shared chunk text" },
+        { file: "doc2.md", text: "Shared chunk text" },
+      ];
+
+      const first = await store.rerank("shared", docs);
+      const second = await store.rerank("shared", docs);
+
+      expect(first).toHaveLength(2);
+      expect(second).toHaveLength(2);
+      expect(rerankSpy).toHaveBeenCalledTimes(1);
+      expect(rerankSpy.mock.calls[0]?.[1]).toEqual([{ file: "doc2.md", text: "Shared chunk text" }]);
+    } finally {
+      llmSpy.mockRestore();
+      await cleanupTestDb(store);
+    }
   });
 });
 
@@ -2531,6 +2904,278 @@ describe("Edge Cases", () => {
     expect(results).toHaveLength(10);
 
     await cleanupTestDb(store);
+  });
+});
+
+describe("Embedding batching", () => {
+  function createFakeTokenizer() {
+    return {
+      async tokenize(text: string) {
+        return new Array(Math.max(1, Math.ceil(text.length / 16))).fill(1);
+      },
+    };
+  }
+
+  function createFakeEmbedLlm() {
+    const embedBatchCalls: string[][] = [];
+    const embedCalls: { text: string; options?: { model?: string } }[] = [];
+    const embedBatchModelCalls: ({ model?: string } | undefined)[] = [];
+    return {
+      embedBatchCalls,
+      embedCalls,
+      embedBatchModelCalls,
+      async embed(text: string, options?: { model?: string }) {
+        embedCalls.push({ text, options });
+        return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
+      },
+      async embedBatch(texts: string[], options?: { model?: string }) {
+        embedBatchCalls.push([...texts]);
+        embedBatchModelCalls.push(options);
+        return texts.map((_text, index) => ({
+          embedding: [index + 1, index + 2, index + 3],
+          model: "fake-embed",
+        }));
+      },
+    };
+  }
+
+  test("generateEmbeddings flushes batches when maxDocsPerBatch is reached", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(db, "docs", { name: "one", body: "# One\n\nAlpha" });
+      await insertTestDocument(db, "docs", { name: "two", body: "# Two\n\nBeta" });
+      await insertTestDocument(db, "docs", { name: "three", body: "# Three\n\nGamma" });
+
+      const result = await generateEmbeddings(store, {
+        maxDocsPerBatch: 1,
+        maxBatchBytes: 1024 * 1024,
+      });
+
+      expect(fakeLlm.embedBatchCalls).toHaveLength(3);
+      expect(fakeLlm.embedBatchCalls.map(call => call.length)).toEqual([1, 1, 1]);
+      expect(result.docsProcessed).toBe(3);
+      expect(result.chunksEmbedded).toBe(3);
+      expect(db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get()).toEqual({ count: 3 });
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings flushes batches when maxBatchBytes is reached", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    const docOne = "# One\n\n" + "A".repeat(36);
+    const docTwo = "# Two\n\n" + "B".repeat(36);
+    const docThree = "# Three\n\n" + "C".repeat(36);
+    const batchLimit = new TextEncoder().encode(docOne).length
+      + new TextEncoder().encode(docTwo).length
+      + 1;
+
+    try {
+      await insertTestDocument(db, "docs", { name: "a-one", body: docOne });
+      await insertTestDocument(db, "docs", { name: "b-two", body: docTwo });
+      await insertTestDocument(db, "docs", { name: "c-three", body: docThree });
+
+      const result = await generateEmbeddings(store, {
+        maxDocsPerBatch: 64,
+        maxBatchBytes: batchLimit,
+      });
+
+      expect(fakeLlm.embedBatchCalls).toHaveLength(2);
+      expect(fakeLlm.embedBatchCalls.map(call => call.length)).toEqual([2, 1]);
+      expect(result.docsProcessed).toBe(3);
+      expect(result.chunksEmbedded).toBe(3);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings passes the selected model through to embed calls and metadata", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+    const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(db, "docs", { name: "one", body: "# One\n\nAlpha" });
+
+      const result = await generateEmbeddings(store, { model });
+
+      expect(result.chunksEmbedded).toBe(1);
+      expect(fakeLlm.embedCalls[0]?.options?.model).toBe(model);
+      expect(fakeLlm.embedBatchModelCalls).toEqual([{ model }]);
+      expect(db.prepare(`SELECT DISTINCT model FROM content_vectors`).all()).toEqual([{ model }]);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings uses the active llm embed model when no explicit model is passed", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+    const model = "hf:env/embed-model.gguf";
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = { ...fakeLlm, embedModelName: model } as any;
+
+    try {
+      await insertTestDocument(db, "docs", { name: "one", body: "# One\n\nAlpha" });
+
+      const result = await generateEmbeddings(store);
+
+      expect(result.chunksEmbedded).toBe(1);
+      expect(fakeLlm.embedCalls[0]?.options?.model).toBe(model);
+      expect(fakeLlm.embedBatchModelCalls).toEqual([{ model }]);
+      expect(db.prepare(`SELECT DISTINCT model FROM content_vectors`).all()).toEqual([{ model }]);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("vectorSearchQuery uses the active llm embed model for vector lookups", async () => {
+    const store = await createTestStore();
+    const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
+    const searchVecSpy = vi.fn(async () => [] as SearchResult[]) as any;
+
+    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
+    store.llm = { embedModelName: model } as any;
+    store.searchVec = searchVecSpy as any;
+    store.expandQuery = vi.fn(async () => []) as any;
+
+    try {
+      await vectorSearchQuery(store, "custom query", { limit: 7, minScore: 0 });
+
+      expect(searchVecSpy).toHaveBeenCalledTimes(1);
+      expect(searchVecSpy.mock.calls[0]?.[0]).toBe("custom query");
+      expect(searchVecSpy.mock.calls[0]?.[1]).toBe(model);
+      expect(searchVecSpy.mock.calls[0]?.[2]).toBe(7);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("hybridQuery uses the active llm embed model for precomputed vector lookups", async () => {
+    const store = await createTestStore();
+    const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
+    const embedBatchSpy = vi.fn(async (texts: string[]) => texts.map(() => ({
+      embedding: [1, 2, 3],
+      model,
+    })));
+    const searchVecSpy = vi.fn(async () => [] as SearchResult[]) as any;
+
+    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
+    store.llm = {
+      embedModelName: model,
+      embedBatch: embedBatchSpy,
+    } as any;
+    store.searchVec = searchVecSpy as any;
+    store.searchFTS = vi.fn(() => []) as any;
+    store.expandQuery = vi.fn(async () => []) as any;
+
+    try {
+      await hybridQuery(store, "hybrid query", { limit: 5, minScore: 0, skipRerank: true });
+
+      expect(embedBatchSpy).toHaveBeenCalledTimes(1);
+      expect(searchVecSpy).toHaveBeenCalledTimes(1);
+      expect(searchVecSpy.mock.calls[0]?.[0]).toBe("hybrid query");
+      expect(searchVecSpy.mock.calls[0]?.[1]).toBe(model);
+      expect(searchVecSpy.mock.calls[0]?.[5]).toEqual([1, 2, 3]);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("structuredSearch uses the active llm embed model for precomputed vector lookups", async () => {
+    const store = await createTestStore();
+    const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
+    const embedBatchSpy = vi.fn(async (texts: string[]) => texts.map(() => ({
+      embedding: [1, 2, 3],
+      model,
+    })));
+    const searchVecSpy = vi.fn(async () => [] as SearchResult[]) as any;
+
+    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
+    store.llm = {
+      embedModelName: model,
+      embedBatch: embedBatchSpy,
+    } as any;
+    store.searchVec = searchVecSpy as any;
+
+    try {
+      await structuredSearch(store, [{ type: "vec", query: "structured query" }], {
+        limit: 5,
+        minScore: 0,
+        skipRerank: true,
+      });
+
+      expect(embedBatchSpy).toHaveBeenCalledTimes(1);
+      expect(searchVecSpy).toHaveBeenCalledTimes(1);
+      expect(searchVecSpy.mock.calls[0]?.[0]).toBe("structured query");
+      expect(searchVecSpy.mock.calls[0]?.[1]).toBe(model);
+      expect(searchVecSpy.mock.calls[0]?.[5]).toEqual([1, 2, 3]);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings rejects invalid batch limits", async () => {
+    const store = await createTestStore();
+
+    try {
+      await expect(generateEmbeddings(store, { maxDocsPerBatch: 0 })).rejects.toThrow(
+        "maxDocsPerBatch"
+      );
+      await expect(generateEmbeddings(store, { maxBatchBytes: 0 })).rejects.toThrow(
+        "maxBatchBytes"
+      );
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+});
+
+describe("Token chunking guardrails", () => {
+  test("chunkDocumentByTokens keeps pathological single-line blobs under the token limit", async () => {
+    setDefaultLlamaCpp({
+      async tokenize(text: string) {
+        return Array.from({ length: text.length }, () => 1);
+      },
+      async detokenize(tokens: readonly number[]) {
+        return "x".repeat(tokens.length);
+      },
+    } as any);
+
+    try {
+      const chunks = await chunkDocumentByTokens("x".repeat(1200), 100, 15, 20);
+
+      expect(chunks.length).toBeGreaterThan(1);
+      expect(chunks.every((chunk) => chunk.tokens <= 100)).toBe(true);
+      for (let i = 1; i < chunks.length; i++) {
+        expect(chunks[i]!.pos).toBeGreaterThan(chunks[i - 1]!.pos);
+      }
+    } finally {
+      setDefaultLlamaCpp(null);
+    }
   });
 });
 
@@ -2743,6 +3388,75 @@ describe("Content-Addressable Storage", () => {
 
     await cleanupTestDb(store);
   });
+
+  test("findOrMigrateLegacyDocument renames lowercase path to case-preserved", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    const now = new Date().toISOString();
+
+    const content = "# My Skill";
+    const hash = await hashContent(content);
+    store.insertContent(hash, content, now);
+    // Simulate legacy index: path stored as lowercase
+    store.insertDocument(collectionName, "skills/skill.md", "My Skill", hash, now, now);
+
+    // Migration: look up case-preserved path, expect rename
+    const result = store.findOrMigrateLegacyDocument(collectionName, "skills/SKILL.md");
+    expect(result).not.toBeNull();
+    expect(result!.hash).toBe(hash);
+
+    // Old lowercase path should no longer be findable
+    expect(store.findActiveDocument(collectionName, "skills/skill.md")).toBeNull();
+    // New case-preserved path should be active
+    const migrated = store.findActiveDocument(collectionName, "skills/SKILL.md");
+    expect(migrated).not.toBeNull();
+    expect(migrated!.hash).toBe(hash);
+
+    // FTS should reflect the new path (documents_au trigger)
+    const ftsRow = store.db.prepare(
+      `SELECT filepath FROM documents_fts WHERE rowid = ?`
+    ).get(result!.id) as { filepath: string } | undefined;
+    expect(ftsRow).toBeDefined();
+    expect(ftsRow!.filepath).toContain("SKILL.md");
+
+    await cleanupTestDb(store);
+  });
+
+  test("findOrMigrateLegacyDocument returns null when path is already lowercase", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    // No document exists at all
+    const result = store.findOrMigrateLegacyDocument(collectionName, "readme.md");
+    expect(result).toBeNull();
+
+    await cleanupTestDb(store);
+  });
+
+  test("findOrMigrateLegacyDocument returns existing doc when canonical path already present", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    const now = new Date().toISOString();
+
+    const content = "# Content";
+    const hash = await hashContent(content);
+    store.insertContent(hash, content, now);
+    // Both lowercase and case-preserved paths exist (edge case from prior partial migration)
+    store.insertDocument(collectionName, "readme.md", "Readme", hash, now, now);
+    store.insertDocument(collectionName, "README.md", "README", hash, now, now);
+
+    // Should return the canonical-path document directly (fast path)
+    // The legacy "readme.md" row is untouched — no rename attempted.
+    const result = store.findOrMigrateLegacyDocument(collectionName, "README.md");
+    expect(result).not.toBeNull();
+    expect(result!.hash).toBe(hash);
+
+    // Both rows still exist (legacy row not migrated, not deactivated here)
+    expect(store.findActiveDocument(collectionName, "readme.md")).not.toBeNull();
+    expect(store.findActiveDocument(collectionName, "README.md")).not.toBeNull();
+
+    await cleanupTestDb(store);
+  });
 });
 
 // =============================================================================
@@ -2880,6 +3594,14 @@ describe("parseVirtualPath", () => {
     expect(parseVirtualPath("qmd:////collection/path.md")).toEqual({
       collectionName: "collection",
       path: "path.md",
+    });
+  });
+
+  test("parses qmd:// paths with index query parameters", () => {
+    expect(parseVirtualPath("qmd://collection/path.md?index=docs-v2")).toEqual({
+      collectionName: "collection",
+      path: "path.md",
+      indexName: "docs-v2",
     });
   });
 

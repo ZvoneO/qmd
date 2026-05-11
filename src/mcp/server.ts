@@ -9,22 +9,28 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { fileURLToPath } from "url";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { WebStandardStreamableHTTPServerTransport }
   from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { existsSync } from "fs";
 import {
   createStore,
   extractSnippet,
   addLineNumbers,
-  structuredSearch,
+  getDefaultDbPath,
   DEFAULT_MULTI_GET_MAX_BYTES,
-} from "./store.js";
-import type { Store, StructuredSubSearch } from "./store.js";
-import { getCollection, getGlobalContext, getDefaultCollectionNames } from "./collections.js";
-import { disposeDefaultLlamaCpp } from "./llm.js";
+  type QMDStore,
+  type ExpandedQuery,
+  type IndexStatus,
+} from "../index.js";
+import { getConfigPath } from "../collections.js";
+import { enableProductionMode } from "../store.js";
 
 // =============================================================================
 // Types for structured content
@@ -45,8 +51,8 @@ type StatusResult = {
   hasVectorIndex: boolean;
   collections: {
     name: string;
-    path: string;
-    pattern: string;
+    path: string | null;
+    pattern: string | null;
     documents: number;
     lastUpdated: string;
   }[];
@@ -79,6 +85,16 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
   return lines.join('\n');
 }
 
+function getPackageVersion(): string {
+  try {
+    const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "../../package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+    return pkg.version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
 // =============================================================================
 // MCP Server
 // =============================================================================
@@ -88,12 +104,13 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
  * Injected into the LLM's system prompt via MCP initialize response —
  * gives the LLM immediate context about what's searchable without a tool call.
  */
-function buildInstructions(store: Store): string {
-  const status = store.getStatus();
+async function buildInstructions(store: QMDStore): Promise<string> {
+  const status = await store.getStatus();
+  const contexts = await store.listContexts();
+  const globalCtx = await store.getGlobalContext();
   const lines: string[] = [];
 
   // --- What is this? ---
-  const globalCtx = getGlobalContext();
   lines.push(`QMD is your local search engine over ${status.totalDocuments} markdown documents.`);
   if (globalCtx) lines.push(`Context: ${globalCtx}`);
 
@@ -102,9 +119,9 @@ function buildInstructions(store: Store): string {
     lines.push("");
     lines.push("Collections (scope with `collection` parameter):");
     for (const col of status.collections) {
-      const collConfig = getCollection(col.name);
-      const rootCtx = collConfig?.context?.[""] || collConfig?.context?.["/"];
-      const desc = rootCtx ? ` — ${rootCtx}` : "";
+      // Find root context for this collection
+      const rootCtx = contexts.find(c => c.collection === col.name && (c.path === "" || c.path === "/"));
+      const desc = rootCtx ? ` — ${rootCtx.context}` : "";
       lines.push(`  - "${col.name}" (${col.documents} docs)${desc}`);
     }
   }
@@ -125,10 +142,13 @@ function buildInstructions(store: Store): string {
   lines.push("  - type:'vec' — semantic vector search (meaning-based)");
   lines.push("  - type:'hyde' — hypothetical document (write what the answer looks like)");
   lines.push("");
+  lines.push("  Always provide `intent` on every search call to disambiguate and improve snippets.");
+  lines.push("");
   lines.push("Examples:");
   lines.push("  Quick keyword lookup: [{type:'lex', query:'error handling'}]");
   lines.push("  Semantic search: [{type:'vec', query:'how to handle errors gracefully'}]");
   lines.push("  Best results: [{type:'lex', query:'error'}, {type:'vec', query:'error handling best practices'}]");
+  lines.push("  With intent: searches=[{type:'lex', query:'performance'}], intent='web page load times'");
 
   // --- Retrieval workflow ---
   lines.push("");
@@ -150,11 +170,14 @@ function buildInstructions(store: Store): string {
  * Create an MCP server with all QMD tools, resources, and prompts registered.
  * Shared by both stdio and HTTP transports.
  */
-function createMcpServer(store: Store): McpServer {
+async function createMcpServer(store: QMDStore): Promise<McpServer> {
   const server = new McpServer(
-    { name: "qmd", version: "0.9.9" },
-    { instructions: buildInstructions(store) },
+    { name: "qmd", version: getPackageVersion() },
+    { instructions: await buildInstructions(store) },
   );
+
+  // Pre-fetch default collection names for search tools
+  const defaultCollectionNames = await store.getDefaultCollectionNames();
 
   // ---------------------------------------------------------------------------
   // Resource: qmd://{path} - read-only access to documents by path
@@ -174,49 +197,23 @@ function createMcpServer(store: Store): McpServer {
       const pathStr = Array.isArray(path) ? path.join('/') : (path || '');
       const decodedPath = decodeURIComponent(pathStr);
 
-      // Parse virtual path: collection/relative/path
-      const parts = decodedPath.split('/');
-      const collection = parts[0] || '';
-      const relativePath = parts.slice(1).join('/');
+      // Use SDK to find document — findDocument handles collection/path resolution
+      const result = await store.get(decodedPath, { includeBody: true });
 
-      // Find document by collection and path, join with content table
-      let doc = store.db.prepare(`
-        SELECT d.collection, d.path, d.title, c.doc as body
-        FROM documents d
-        JOIN content c ON c.hash = d.hash
-        WHERE d.collection = ? AND d.path = ? AND d.active = 1
-      `).get(collection, relativePath) as { collection: string; path: string; title: string; body: string } | null;
-
-      // Try suffix match if exact match fails
-      if (!doc) {
-        doc = store.db.prepare(`
-          SELECT d.collection, d.path, d.title, c.doc as body
-          FROM documents d
-          JOIN content c ON c.hash = d.hash
-          WHERE d.path LIKE ? AND d.active = 1
-          LIMIT 1
-        `).get(`%${relativePath}`) as { collection: string; path: string; title: string; body: string } | null;
-      }
-
-      if (!doc) {
+      if ("error" in result) {
         return { contents: [{ uri: uri.href, text: `Document not found: ${decodedPath}` }] };
       }
 
-      // Construct virtual path for context lookup
-      const virtualPath = `qmd://${doc.collection}/${doc.path}`;
-      const context = store.getContextForFile(virtualPath);
-
-      let text = addLineNumbers(doc.body);  // Default to line numbers
-      if (context) {
-        text = `<!-- Context: ${context} -->\n\n` + text;
+      let text = addLineNumbers(result.body || "");  // Default to line numbers
+      if (result.context) {
+        text = `<!-- Context: ${result.context} -->\n\n` + text;
       }
 
-      const displayName = `${doc.collection}/${doc.path}`;
       return {
         contents: [{
           uri: uri.href,
-          name: displayName,
-          title: doc.title || doc.path,
+          name: result.displayPath,
+          title: result.title || result.displayPath,
           mimeType: "text/markdown",
           text,
         }],
@@ -307,23 +304,35 @@ Intent-aware lex (C++ performance, not sports):
         ),
         limit: z.number().optional().default(10).describe("Max results (default: 10)"),
         minScore: z.number().optional().default(0).describe("Min relevance 0-1 (default: 0)"),
+        candidateLimit: z.number().optional().describe(
+          "Maximum candidates to rerank (default: 40, lower = faster but may miss results)"
+        ),
         collections: z.array(z.string()).optional().describe("Filter to collections (OR match)"),
+        intent: z.string().optional().describe(
+          "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
+        ),
+        rerank: z.boolean().optional().default(true).describe(
+          "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
+        ),
       },
     },
-    async ({ searches, limit, minScore, collections }) => {
+    async ({ searches, limit, minScore, candidateLimit, collections, intent, rerank }) => {
       // Map to internal format
-      const subSearches: StructuredSubSearch[] = searches.map(s => ({
+      const queries: ExpandedQuery[] = searches.map(s => ({
         type: s.type,
         query: s.query,
       }));
 
       // Use default collections if none specified
-      const effectiveCollections = collections ?? getDefaultCollectionNames();
+      const effectiveCollections = collections ?? defaultCollectionNames;
 
-      const results = await structuredSearch(store, subSearches, {
+      const results = await store.search({
+        queries,
         collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
         limit,
         minScore,
+        rerank,
+        intent,
       });
 
       // Use first lex or vec query for snippet extraction
@@ -332,7 +341,7 @@ Intent-aware lex (C++ performance, not sports):
         || searches[0]?.query || "";
 
       const filtered: SearchResultItem[] = results.map(r => {
-        const { line, snippet } = extractSnippet(r.bestChunk, primaryQuery, 300);
+        const { line, snippet } = extractSnippet(r.bestChunk, primaryQuery, 300, undefined, undefined, intent);
         return {
           docid: `#${r.docid}`,
           file: r.displayPath,
@@ -377,7 +386,7 @@ Intent-aware lex (C++ performance, not sports):
         lookup = lookup.slice(0, -colonMatch[0].length);
       }
 
-      const result = store.findDocument(lookup, { includeBody: false });
+      const result = await store.get(lookup, { includeBody: false });
 
       if ("error" in result) {
         let msg = `Document not found: ${file}`;
@@ -390,7 +399,7 @@ Intent-aware lex (C++ performance, not sports):
         };
       }
 
-      const body = store.getDocumentBody(result, parsedFromLine, maxLines) ?? "";
+      const body = await store.getDocumentBody(result.filepath, { fromLine: parsedFromLine, maxLines }) ?? "";
       let text = body;
       if (lineNumbers) {
         const startLine = parsedFromLine || 1;
@@ -433,7 +442,7 @@ Intent-aware lex (C++ performance, not sports):
       },
     },
     async ({ pattern, maxLines, maxBytes, lineNumbers }) => {
-      const { docs, errors } = store.findDocuments(pattern, { includeBody: true, maxBytes: maxBytes || DEFAULT_MULTI_GET_MAX_BYTES });
+      const { docs, errors } = await store.multiGet(pattern, { includeBody: true, maxBytes: maxBytes || DEFAULT_MULTI_GET_MAX_BYTES });
 
       if (docs.length === 0 && errors.length === 0) {
         return {
@@ -501,7 +510,7 @@ Intent-aware lex (C++ performance, not sports):
       inputSchema: {},
     },
     async () => {
-      const status: StatusResult = store.getStatus();
+      const status: StatusResult = await store.getStatus();
 
       const summary = [
         `QMD Index Status:`,
@@ -512,7 +521,7 @@ Intent-aware lex (C++ performance, not sports):
       ];
 
       for (const col of status.collections) {
-        summary.push(`    - ${col.path} (${col.documents} docs)`);
+        summary.push(`    - ${col.name}: ${col.path} (${col.documents} docs)`);
       }
 
       return {
@@ -529,9 +538,23 @@ Intent-aware lex (C++ performance, not sports):
 // Transport: stdio (default)
 // =============================================================================
 
-export async function startMcpServer(): Promise<void> {
-  const store = createStore();
-  const server = createMcpServer(store);
+export type McpStartupOptions = {
+  dbPath?: string;
+};
+
+export async function startMcpServer(options: McpStartupOptions = {}): Promise<void> {
+  // Opt into production mode when the MCP server is actually started, not
+  // when this module is merely imported for its exports. Importing the module
+  // at the top level flipped the global production flag and broke test
+  // isolation for downstream suites that expect the default (development)
+  // database path behaviour.
+  enableProductionMode();
+  const configPath = getConfigPath();
+  const store = await createStore({
+    dbPath: options.dbPath ?? getDefaultDbPath(),
+    ...(existsSync(configPath) ? { configPath } : {}),
+  });
+  const server = await createMcpServer(store);
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
@@ -550,14 +573,47 @@ export type HttpServerHandle = {
  * Start MCP server over Streamable HTTP (JSON responses, no SSE).
  * Binds to localhost only. Returns a handle for shutdown and port discovery.
  */
-export async function startMcpHttpServer(port: number, options?: { quiet?: boolean }): Promise<HttpServerHandle> {
-  const store = createStore();
-  const mcpServer = createMcpServer(store);
-  const transport = new WebStandardStreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-    enableJsonResponse: true,
+export async function startMcpHttpServer(
+  port: number,
+  options: ({ quiet?: boolean } & McpStartupOptions) = {},
+): Promise<HttpServerHandle> {
+  // See startMcpServer() for the rationale — flip production mode here so the
+  // HTTP transport resolves the real database path, without leaking state into
+  // callers that only import this module for its exports (e.g. tests).
+  enableProductionMode();
+  const configPath = getConfigPath();
+  const store = await createStore({
+    dbPath: options.dbPath ?? getDefaultDbPath(),
+    ...(existsSync(configPath) ? { configPath } : {}),
   });
-  await mcpServer.connect(transport);
+
+  // Pre-fetch default collection names for REST endpoint
+  const defaultCollectionNames = await store.getDefaultCollectionNames();
+
+  // Session map: each client gets its own McpServer + Transport pair (MCP spec requirement).
+  // The store is shared — it's stateless SQLite, safe for concurrent access.
+  const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
+
+  async function createSession(): Promise<WebStandardStreamableHTTPServerTransport> {
+    const transport = new WebStandardStreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      enableJsonResponse: true,
+      onsessioninitialized: (sessionId: string) => {
+        sessions.set(sessionId, transport);
+        log(`${ts()} New session ${sessionId} (${sessions.size} active)`);
+      },
+    });
+    const server = await createMcpServer(store);
+    await server.connect(transport);
+
+    transport.onclose = () => {
+      if (transport.sessionId) {
+        sessions.delete(transport.sessionId);
+      }
+    };
+
+    return transport;
+  }
 
   const startTime = Date.now();
   const quiet = options?.quiet ?? false;
@@ -614,7 +670,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
       if ((pathname === "/query" || pathname === "/search") && nodeReq.method === "POST") {
         const rawBody = await collectBody(nodeReq);
         const params = JSON.parse(rawBody);
-        
+
         // Validate required fields
         if (!params.searches || !Array.isArray(params.searches)) {
           nodeRes.writeHead(400, { "Content-Type": "application/json" });
@@ -623,18 +679,21 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         }
 
         // Map to internal format
-        const subSearches: StructuredSubSearch[] = params.searches.map((s: any) => ({
+        const queries: ExpandedQuery[] = params.searches.map((s: any) => ({
           type: s.type as 'lex' | 'vec' | 'hyde',
           query: String(s.query || ""),
         }));
 
         // Use default collections if none specified
-        const effectiveCollections = params.collections ?? getDefaultCollectionNames();
+        const effectiveCollections = params.collections ?? defaultCollectionNames;
 
-        const results = await structuredSearch(store, subSearches, {
+        const results = await store.search({
+          queries,
           collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
           limit: params.limit ?? 10,
           minScore: params.minScore ?? 0,
+          intent: params.intent,
+          rerank: params.rerank,
         });
 
         // Use first lex or vec query for snippet extraction
@@ -669,8 +728,38 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         for (const [k, v] of Object.entries(nodeReq.headers)) {
           if (typeof v === "string") headers[k] = v;
         }
+
+        // Route to existing session or create new one on initialize
+        const sessionId = headers["mcp-session-id"];
+        let transport: WebStandardStreamableHTTPServerTransport;
+
+        if (sessionId) {
+          const existing = sessions.get(sessionId);
+          if (!existing) {
+            nodeRes.writeHead(404, { "Content-Type": "application/json" });
+            nodeRes.end(JSON.stringify({
+              jsonrpc: "2.0",
+              error: { code: -32001, message: "Session not found" },
+              id: body?.id ?? null,
+            }));
+            return;
+          }
+          transport = existing;
+        } else if (isInitializeRequest(body)) {
+          transport = await createSession();
+        } else {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({
+            jsonrpc: "2.0",
+            error: { code: -32000, message: "Bad Request: Missing session ID" },
+            id: body?.id ?? null,
+          }));
+          return;
+        }
+
         const request = new Request(url, { method: "POST", headers, body: rawBody });
         const response = await transport.handleRequest(request, { parsedBody: body });
+
         nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
         nodeRes.end(Buffer.from(await response.arrayBuffer()));
         log(`${ts()} POST /mcp ${label} (${Date.now() - reqStart}ms)`);
@@ -678,11 +767,34 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
       }
 
       if (pathname === "/mcp") {
-        const url = `http://localhost:${port}${pathname}`;
         const headers: Record<string, string> = {};
         for (const [k, v] of Object.entries(nodeReq.headers)) {
           if (typeof v === "string") headers[k] = v;
         }
+
+        // GET/DELETE must have a valid session
+        const sessionId = headers["mcp-session-id"];
+        if (!sessionId) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({
+            jsonrpc: "2.0",
+            error: { code: -32000, message: "Bad Request: Missing session ID" },
+            id: null,
+          }));
+          return;
+        }
+        const transport = sessions.get(sessionId);
+        if (!transport) {
+          nodeRes.writeHead(404, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({
+            jsonrpc: "2.0",
+            error: { code: -32001, message: "Session not found" },
+            id: null,
+          }));
+          return;
+        }
+
+        const url = `http://localhost:${port}${pathname}`;
         const rawBody = nodeReq.method !== "GET" && nodeReq.method !== "HEAD" ? await collectBody(nodeReq) : undefined;
         const request = new Request(url, { method: nodeReq.method || "GET", headers, ...(rawBody ? { body: rawBody } : {}) });
         const response = await transport.handleRequest(request);
@@ -711,10 +823,12 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
   const stop = async () => {
     if (stopping) return;
     stopping = true;
-    await transport.close();
+    for (const transport of sessions.values()) {
+      await transport.close();
+    }
+    sessions.clear();
     httpServer.close();
-    store.close();
-    await disposeDefaultLlamaCpp();
+    await store.close();
   };
 
   process.on("SIGTERM", async () => {
@@ -733,6 +847,6 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 }
 
 // Run if this is the main module
-if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsWith("/mcp.ts") || process.argv[1]?.endsWith("/mcp.js")) {
+if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsWith("/server.ts") || process.argv[1]?.endsWith("/server.js")) {
   startMcpServer().catch(console.error);
 }

@@ -74,12 +74,10 @@ qmd get "docs/api-reference.md" --full
 Although the tool works perfectly fine when you just tell your agent to use it on the command line, it also exposes an MCP (Model Context Protocol) server for tighter integration.
 
 **Tools exposed:**
-- `qmd_search` - Fast BM25 keyword search (supports collection filter)
-- `qmd_vector_search` - Semantic vector search (supports collection filter)
-- `qmd_deep_search` - Deep search with query expansion and reranking (supports collection filter)
-- `qmd_get` - Retrieve document by path or docid (with fuzzy matching suggestions)
-- `qmd_multi_get` - Retrieve multiple documents by glob pattern, list, or docids
-- `qmd_status` - Index health and collection info
+- `query` — Search with typed sub-queries (`lex`/`vec`/`hyde`), combined via RRF + reranking
+- `get` — Retrieve a document by path or docid (with fuzzy matching suggestions)
+- `multi_get` — Batch retrieve by glob pattern, comma-separated list, or docids
+- `status` — Index health and collection info
 
 **Claude Desktop configuration** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
@@ -97,8 +95,8 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 **Claude Code** — Install the plugin (recommended):
 
 ```bash
-claude marketplace add tobi/qmd
-claude plugin add qmd@qmd
+claude plugin marketplace add tobi/qmd
+claude plugin install qmd@qmd
 ```
 
 Or configure MCP manually in `~/.claude/settings.json`:
@@ -136,6 +134,243 @@ The HTTP server exposes two endpoints:
 LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are disposed after 5 min idle and transparently recreated on the next request (~1s penalty, models remain loaded).
 
 Point any MCP client at `http://localhost:8181/mcp` to connect.
+
+### SDK / Library Usage
+
+Use QMD as a library in your own Node.js or Bun applications.
+
+#### Installation
+
+```sh
+npm install @tobilu/qmd
+```
+
+#### Quick Start
+
+```typescript
+import { createStore } from '@tobilu/qmd'
+
+const store = await createStore({
+  dbPath: './my-index.sqlite',
+  config: {
+    collections: {
+      docs: { path: '/path/to/docs', pattern: '**/*.md' },
+    },
+  },
+})
+
+const results = await store.search({ query: "authentication flow" })
+console.log(results.map(r => `${r.title} (${Math.round(r.score * 100)}%)`))
+
+await store.close()
+```
+
+#### Store Creation
+
+`createStore()` accepts three modes:
+
+```typescript
+import { createStore } from '@tobilu/qmd'
+
+// 1. Inline config — no files needed besides the DB
+const store = await createStore({
+  dbPath: './index.sqlite',
+  config: {
+    collections: {
+      docs: { path: '/path/to/docs', pattern: '**/*.md' },
+      notes: { path: '/path/to/notes' },
+    },
+  },
+})
+
+// 2. YAML config file — collections defined in a file
+const store2 = await createStore({
+  dbPath: './index.sqlite',
+  configPath: './qmd.yml',
+})
+
+// 3. DB-only — reopen a previously configured store
+const store3 = await createStore({ dbPath: './index.sqlite' })
+```
+
+#### Search
+
+The unified `search()` method handles both simple queries and pre-expanded structured queries:
+
+```typescript
+// Simple query — auto-expanded via LLM, then BM25 + vector + reranking
+const results = await store.search({ query: "authentication flow" })
+
+// With options
+const results2 = await store.search({
+  query: "rate limiting",
+  intent: "API throttling and abuse prevention",
+  collection: "docs",
+  limit: 5,
+  minScore: 0.3,
+  explain: true,
+})
+
+// Pre-expanded queries — skip auto-expansion, control each sub-query
+const results3 = await store.search({
+  queries: [
+    { type: 'lex', query: '"connection pool" timeout -redis' },
+    { type: 'vec', query: 'why do database connections time out under load' },
+  ],
+  collections: ["docs", "notes"],
+})
+
+// Skip reranking for faster results
+const fast = await store.search({ query: "auth", rerank: false })
+```
+
+For direct backend access:
+
+```typescript
+// BM25 keyword search (fast, no LLM)
+const lexResults = await store.searchLex("auth middleware", { limit: 10 })
+
+// Vector similarity search (embedding model, no reranking)
+const vecResults = await store.searchVector("how users log in", { limit: 10 })
+
+// Manual query expansion for full control
+const expanded = await store.expandQuery("auth flow", { intent: "user login" })
+const results4 = await store.search({ queries: expanded })
+```
+
+#### Retrieval
+
+```typescript
+// Get a document by path or docid
+const doc = await store.get("docs/readme.md")
+const byId = await store.get("#abc123")
+
+if (!("error" in doc)) {
+  console.log(doc.title, doc.displayPath, doc.context)
+}
+
+// Get document body with line range
+const body = await store.getDocumentBody("docs/readme.md", {
+  fromLine: 50,
+  maxLines: 100,
+})
+
+// Batch retrieve by glob or comma-separated list
+const { docs, errors } = await store.multiGet("docs/**/*.md", {
+  maxBytes: 20480,
+})
+```
+
+#### Collections
+
+```typescript
+// Add a collection
+await store.addCollection("myapp", {
+  path: "/src/myapp",
+  pattern: "**/*.ts",
+  ignore: ["node_modules/**", "*.test.ts"],
+})
+
+// List collections with document stats
+const collections = await store.listCollections()
+// => [{ name, pwd, glob_pattern, doc_count, active_count, last_modified, includeByDefault }]
+
+// Get names of collections included in queries by default
+const defaults = await store.getDefaultCollectionNames()
+
+// Remove / rename
+await store.removeCollection("myapp")
+await store.renameCollection("old-name", "new-name")
+```
+
+#### Context
+
+Context adds descriptive metadata that improves search relevance and is returned alongside results:
+
+```typescript
+// Add context for a path within a collection
+await store.addContext("docs", "/api", "REST API reference documentation")
+
+// Set global context (applies to all collections)
+await store.setGlobalContext("Internal engineering documentation")
+
+// List all contexts
+const contexts = await store.listContexts()
+// => [{ collection, path, context }]
+
+// Remove context
+await store.removeContext("docs", "/api")
+await store.setGlobalContext(undefined)  // clear global
+```
+
+#### Indexing
+
+```typescript
+// Re-index collections by scanning the filesystem
+const result = await store.update({
+  collections: ["docs"],  // optional — defaults to all
+  onProgress: ({ collection, file, current, total }) => {
+    console.log(`[${collection}] ${current}/${total} ${file}`)
+  },
+})
+// => { collections, indexed, updated, unchanged, removed, needsEmbedding }
+
+// Generate vector embeddings
+const embedResult = await store.embed({
+  force: false,           // true to re-embed everything
+  chunkStrategy: "auto",  // "regex" (default) or "auto" (AST for code files)
+  onProgress: ({ current, total, collection }) => {
+    console.log(`Embedding ${current}/${total}`)
+  },
+})
+```
+
+#### Types
+
+Key types exported for SDK consumers:
+
+```typescript
+import type {
+  QMDStore,            // The store interface
+  SearchOptions,       // Options for search()
+  LexSearchOptions,    // Options for searchLex()
+  VectorSearchOptions, // Options for searchVector()
+  HybridQueryResult,   // Search result with score, snippet, context
+  SearchResult,        // Result from searchLex/searchVector
+  ExpandedQuery,       // Typed sub-query { type: 'lex'|'vec'|'hyde', query }
+  DocumentResult,      // Document metadata + body
+  DocumentNotFound,    // Error with similarFiles suggestions
+  MultiGetResult,      // Batch retrieval result
+  UpdateProgress,      // Progress callback info for update()
+  UpdateResult,        // Aggregated update result
+  EmbedProgress,       // Progress callback info for embed()
+  EmbedResult,         // Embedding result
+  StoreOptions,        // createStore() options
+  CollectionConfig,    // Inline config shape
+  IndexStatus,         // From getStatus()
+  IndexHealthInfo,     // From getIndexHealth()
+} from '@tobilu/qmd'
+```
+
+Utility exports:
+
+```typescript
+import {
+  extractSnippet,              // Extract a relevant snippet from text
+  addLineNumbers,              // Add line numbers to text
+  DEFAULT_MULTI_GET_MAX_BYTES, // Default max file size for multiGet (10KB)
+  Maintenance,                 // Database maintenance operations
+} from '@tobilu/qmd'
+```
+
+#### Lifecycle
+
+```typescript
+// Close the store — disposes LLM models and DB connection
+await store.close()
+```
+
+The SDK requires explicit `dbPath` — no defaults are assumed. This makes it safe to embed in any application without side effects.
 
 ## Architecture
 
@@ -252,11 +487,33 @@ QMD uses three local GGUF models (auto-downloaded on first use):
 
 | Model | Purpose | Size |
 |-------|---------|------|
-| `embeddinggemma-300M-Q8_0` | Vector embeddings | ~300MB |
+| `embeddinggemma-300M-Q8_0` | Vector embeddings (default) | ~300MB |
 | `qwen3-reranker-0.6b-q8_0` | Re-ranking | ~640MB |
 | `qmd-query-expansion-1.7B-q4_k_m` | Query expansion (fine-tuned) | ~1.1GB |
 
 Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
+
+### Custom Embedding Model
+
+Override the default embedding model via the `QMD_EMBED_MODEL` environment variable.
+This is useful for multilingual corpora (e.g. Chinese, Japanese, Korean) where
+`embeddinggemma-300M` has limited coverage.
+
+```sh
+# Use Qwen3-Embedding-0.6B for better multilingual (CJK) support
+export QMD_EMBED_MODEL="hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf"
+
+# After changing the model, re-embed all collections:
+qmd embed -f
+```
+
+Supported model families:
+- **embeddinggemma** (default) — English-optimized, small footprint
+- **Qwen3-Embedding** — Multilingual (119 languages including CJK), MTEB top-ranked
+
+> **Note:** When switching embedding models, you must re-index with `qmd embed -f`
+> since vectors are not cross-compatible between models. The prompt format is
+> automatically adjusted for each model family.
 
 ## Installation
 
@@ -308,7 +565,26 @@ qmd embed
 
 # Force re-embed everything
 qmd embed -f
+
+# Enable AST-aware chunking for code files (TS, JS, Python, Go, Rust)
+qmd embed --chunk-strategy auto
+
+# Also works with query for consistent chunk selection
+qmd query "auth flow" --chunk-strategy auto
 ```
+
+**AST-aware chunking** (`--chunk-strategy auto`) uses tree-sitter to chunk code
+files at function, class, and import boundaries instead of arbitrary text
+positions. This produces higher-quality chunks and better search results for
+codebases. Markdown and other file types always use regex-based chunking
+regardless of strategy.
+
+The default is `regex` (existing behavior). Use `--chunk-strategy auto` to
+opt in. Run `qmd status` to verify which grammars are available.
+
+> **Note:** Tree-sitter grammars are optional dependencies. If they are not
+> installed, `--chunk-strategy auto` falls back to regex-only chunking
+> automatically. Tested on both Node.js and Bun.
 
 ### Context Management
 
@@ -366,6 +642,7 @@ qmd query "user authentication"
 --min-score <num>  # Minimum score threshold (default: 0)
 --full             # Show full document content
 --line-numbers     # Add line numbers to output
+--explain          # Include retrieval score traces (query, JSON/CLI output)
 --index <name>     # Use named index
 
 # Output formats (for search and multi-get)
@@ -387,7 +664,13 @@ qmd get <file>[:line]  # Get document, optionally starting at line
 
 ### Output Format
 
-Default output is colorized CLI format (respects `NO_COLOR` env):
+Default output is colorized CLI format (respects `NO_COLOR` env).
+
+When stdout is a TTY, result paths are emitted as clickable terminal hyperlinks (OSC 8). Clicking a path opens the file in your editor using an editor URI template.
+
+When stdout is not a TTY (for example piped to another command or redirected to a file), QMD emits plain text paths with no escape sequences.
+
+TTY example:
 
 ```
 docs/guide.md:42 #a1b2c3
@@ -409,6 +692,27 @@ Discussion about code quality and craftsmanship
 in the development process.
 ```
 
+Configure the editor link target with `QMD_EDITOR_URI` (or `editor_uri` in config):
+
+```sh
+# VS Code (default)
+export QMD_EDITOR_URI="vscode://file/{path}:{line}:{col}"
+
+# Cursor
+export QMD_EDITOR_URI="cursor://file/{path}:{line}:{col}"
+
+# Zed
+export QMD_EDITOR_URI="zed://file/{path}:{line}:{col}"
+
+# Sublime Text
+export QMD_EDITOR_URI="subl://open?url=file://{path}&line={line}"
+```
+
+Template placeholders:
+- `{path}` absolute filesystem path (URI-encoded)
+- `{line}` 1-based line number
+- `{col}` or `{column}` 1-based column number
+
 - **Path**: Collection-relative path (e.g., `docs/guide.md`)
 - **Docid**: Short hash identifier (e.g., `#a1b2c3`) - use with `qmd get #a1b2c3`
 - **Title**: Extracted from document (first heading or filename)
@@ -427,6 +731,9 @@ qmd search --md --full "error handling"
 
 # JSON output for scripting
 qmd query --json "quarterly reports"
+
+# Inspect how each result was scored (RRF + rerank blend)
+qmd query --json --explain "quarterly reports"
 
 # Use separate index for different knowledge base
 qmd --index work search "quarterly reports"
@@ -490,6 +797,8 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
+| `QMD_LLAMA_GPU` | `auto` | Force llama.cpp GPU backend (`metal`, `vulkan`, `cuda`) or disable GPU with `false` |
+| `QMD_EMBED_PARALLELISM` | automatic | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable. |
 
 ## How It Works
 
@@ -552,6 +861,19 @@ Instead of cutting at hard token boundaries, QMD uses a scoring algorithm to fin
 The squared distance decay means a heading 200 tokens back (score ~30) still beats a simple line break at the target (score 1), but a closer heading wins over a distant one.
 
 **Code Fence Protection:** Break points inside code blocks are ignored—code stays together. If a code block exceeds the chunk size, it's kept whole when possible.
+
+**AST-Aware Chunking (Code Files):**
+
+For supported code files, QMD also parses the source with [tree-sitter](https://tree-sitter.github.io/) and adds AST-derived break points that are merged with the regex scores above:
+
+| AST Node | Score | Languages |
+|----------|-------|-----------|
+| Class / interface / struct / impl / trait | 100 | All |
+| Function / method | 90 | All |
+| Type alias / enum | 80 | All |
+| Import / use declaration | 60 | All |
+
+Supported for `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.go`, and `.rs` files. Enable with `--chunk-strategy auto`. Markdown and other file types always use regex chunking.
 
 ### Query Flow (Hybrid)
 

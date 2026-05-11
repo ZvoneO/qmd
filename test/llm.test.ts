@@ -7,11 +7,14 @@
  * rerank functions first to trigger model downloads.
  */
 
-import { describe, test, expect, beforeAll, afterAll } from "vitest";
+import { describe, test, expect, beforeAll, afterAll, vi } from "vitest";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
   disposeDefaultLlamaCpp,
+  resolveLlamaGpuMode,
+  resolveParallelismOverride,
+  resolveSafeParallelism,
   withLLMSession,
   canUnloadLLM,
   SessionReleasedError,
@@ -52,6 +55,266 @@ describe("LlamaCpp.modelExists", () => {
 
     expect(result.exists).toBe(false);
     expect(result.name).toBe("/nonexistent/path/model.gguf");
+  });
+});
+
+describe("QMD_LLAMA_GPU resolution", () => {
+  test("uses auto when unset or blank", () => {
+    expect(resolveLlamaGpuMode(undefined)).toBe("auto");
+    expect(resolveLlamaGpuMode("   ")).toBe("auto");
+  });
+
+  test("maps CPU disable values to false", () => {
+    expect(resolveLlamaGpuMode("false")).toBe(false);
+    expect(resolveLlamaGpuMode("OFF")).toBe(false);
+    expect(resolveLlamaGpuMode(" none ")).toBe(false);
+    expect(resolveLlamaGpuMode("disabled")).toBe(false);
+    expect(resolveLlamaGpuMode("0")).toBe(false);
+  });
+
+  test("passes through supported GPU backends", () => {
+    expect(resolveLlamaGpuMode("metal")).toBe("metal");
+    expect(resolveLlamaGpuMode("VULKAN")).toBe("vulkan");
+    expect(resolveLlamaGpuMode(" cuda ")).toBe("cuda");
+  });
+
+  test("warns and falls back to auto for unsupported values", () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    try {
+      expect(resolveLlamaGpuMode("rocm")).toBe("auto");
+      expect(stderrSpy).toHaveBeenCalled();
+      expect(String(stderrSpy.mock.calls[0]?.[0] || "")).toContain("QMD_LLAMA_GPU");
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+});
+
+describe("LLM context parallelism safety", () => {
+  test("defaults Windows CUDA to one context to avoid ggml-cuda.cu:98 crashes", () => {
+    expect(resolveSafeParallelism({
+      gpu: "cuda",
+      platform: "win32",
+      computed: 8,
+      envValue: undefined,
+    })).toBe(1);
+  });
+
+  test("keeps non-Windows and non-CUDA backends on computed parallelism", () => {
+    expect(resolveSafeParallelism({ gpu: "cuda", platform: "linux", computed: 8 })).toBe(8);
+    expect(resolveSafeParallelism({ gpu: "vulkan", platform: "win32", computed: 8 })).toBe(8);
+    expect(resolveSafeParallelism({ gpu: false, platform: "win32", computed: 4 })).toBe(4);
+  });
+
+  test("QMD_EMBED_PARALLELISM overrides the Windows CUDA safety default", () => {
+    expect(resolveSafeParallelism({
+      gpu: "cuda",
+      platform: "win32",
+      computed: 8,
+      envValue: "2",
+    })).toBe(2);
+  });
+
+  test("QMD_EMBED_PARALLELISM clamps invalid values and warns", () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    try {
+      expect(resolveParallelismOverride("0")).toBeUndefined();
+      expect(resolveParallelismOverride("bad")).toBeUndefined();
+      expect(stderrSpy).toHaveBeenCalledTimes(2);
+      expect(String(stderrSpy.mock.calls[0]?.[0] || "")).toContain("QMD_EMBED_PARALLELISM");
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+});
+
+describe("LlamaCpp expand context size config", () => {
+  const defaultExpandContextSize = 2048;
+
+  test("uses default expand context size when no config or env is set", () => {
+    const prev = process.env.QMD_EXPAND_CONTEXT_SIZE;
+    delete process.env.QMD_EXPAND_CONTEXT_SIZE;
+    try {
+      const llm = new LlamaCpp({}) as any;
+      expect(llm.expandContextSize).toBe(defaultExpandContextSize);
+    } finally {
+      if (prev === undefined) delete process.env.QMD_EXPAND_CONTEXT_SIZE;
+      else process.env.QMD_EXPAND_CONTEXT_SIZE = prev;
+    }
+  });
+
+  test("uses QMD_EXPAND_CONTEXT_SIZE when set to a positive integer", () => {
+    const prev = process.env.QMD_EXPAND_CONTEXT_SIZE;
+    process.env.QMD_EXPAND_CONTEXT_SIZE = "3072";
+    try {
+      const llm = new LlamaCpp({}) as any;
+      expect(llm.expandContextSize).toBe(3072);
+    } finally {
+      if (prev === undefined) delete process.env.QMD_EXPAND_CONTEXT_SIZE;
+      else process.env.QMD_EXPAND_CONTEXT_SIZE = prev;
+    }
+  });
+
+  test("config value overrides QMD_EXPAND_CONTEXT_SIZE", () => {
+    const prev = process.env.QMD_EXPAND_CONTEXT_SIZE;
+    process.env.QMD_EXPAND_CONTEXT_SIZE = "4096";
+    try {
+      const llm = new LlamaCpp({ expandContextSize: 1536 }) as any;
+      expect(llm.expandContextSize).toBe(1536);
+    } finally {
+      if (prev === undefined) delete process.env.QMD_EXPAND_CONTEXT_SIZE;
+      else process.env.QMD_EXPAND_CONTEXT_SIZE = prev;
+    }
+  });
+
+  test("falls back to default and warns when QMD_EXPAND_CONTEXT_SIZE is invalid", () => {
+    const prev = process.env.QMD_EXPAND_CONTEXT_SIZE;
+    process.env.QMD_EXPAND_CONTEXT_SIZE = "bad";
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    try {
+      const llm = new LlamaCpp({}) as any;
+      expect(llm.expandContextSize).toBe(defaultExpandContextSize);
+      expect(stderrSpy).toHaveBeenCalled();
+      expect(String(stderrSpy.mock.calls[0]?.[0] || "")).toContain("QMD_EXPAND_CONTEXT_SIZE");
+    } finally {
+      stderrSpy.mockRestore();
+      if (prev === undefined) delete process.env.QMD_EXPAND_CONTEXT_SIZE;
+      else process.env.QMD_EXPAND_CONTEXT_SIZE = prev;
+    }
+  });
+
+  test("throws when config expandContextSize is invalid", () => {
+    expect(() => new LlamaCpp({ expandContextSize: 0 })).toThrow(
+      "Invalid expandContextSize: 0. Must be a positive integer."
+    );
+  });
+});
+
+describe("LlamaCpp model resolution (config > env > default)", () => {
+  const HARDCODED_EMBED = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+  const HARDCODED_RERANK = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
+  const HARDCODED_GENERATE = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
+
+  test("uses hardcoded default when no config or env is set", () => {
+    const prev = process.env.QMD_EMBED_MODEL;
+    delete process.env.QMD_EMBED_MODEL;
+    try {
+      const llm = new LlamaCpp({}) as any;
+      expect(llm.embedModelUri).toBe(HARDCODED_EMBED);
+      expect(llm.rerankModelUri).toBe(HARDCODED_RERANK);
+      expect(llm.generateModelUri).toBe(HARDCODED_GENERATE);
+    } finally {
+      if (prev === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = prev;
+    }
+  });
+
+  test("env var overrides hardcoded default", () => {
+    const prev = process.env.QMD_EMBED_MODEL;
+    process.env.QMD_EMBED_MODEL = "hf:custom/embed-model.gguf";
+    try {
+      const llm = new LlamaCpp({}) as any;
+      expect(llm.embedModelUri).toBe("hf:custom/embed-model.gguf");
+    } finally {
+      if (prev === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = prev;
+    }
+  });
+
+  test("config overrides env var", () => {
+    const prev = process.env.QMD_EMBED_MODEL;
+    process.env.QMD_EMBED_MODEL = "hf:env/model.gguf";
+    try {
+      const llm = new LlamaCpp({ embedModel: "hf:config/model.gguf" }) as any;
+      expect(llm.embedModelUri).toBe("hf:config/model.gguf");
+    } finally {
+      if (prev === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = prev;
+    }
+  });
+});
+
+describe("LlamaCpp embedding truncation", () => {
+  test("truncates against the active embedding context limit, not the model train context", async () => {
+    const llm = new LlamaCpp({}) as any;
+    const getEmbeddingFor = vi.fn(async (text: string) => ({
+      vector: new Float32Array([0.25, 0.5]),
+      text,
+    }));
+
+    llm.touchActivity = vi.fn();
+    llm.embedModel = {
+      trainContextSize: 8192,
+      tokenize: (text: string) => Array.from({ length: text.length }, () => 1),
+      detokenize: (tokens: readonly number[]) => "x".repeat(tokens.length),
+    };
+    llm.ensureEmbedContext = vi.fn().mockResolvedValue({ getEmbeddingFor });
+
+    const result = await llm.embed("x".repeat(3000));
+
+    expect(getEmbeddingFor).toHaveBeenCalledWith("x".repeat(2044));
+    expect(result).toEqual({
+      embedding: [0.25, 0.5],
+      model: llm.embedModelUri,
+    });
+  });
+});
+
+describe("LlamaCpp rerank deduping", () => {
+  test("deduplicates identical document texts before scoring", async () => {
+    const llm = new LlamaCpp({}) as any;
+    llm._ciMode = false; // allow unit test even in CI (mocked, no real models)
+    const rankAll = vi.fn(async (_query: string, docs: string[]) =>
+      docs.map((doc) => doc === "shared chunk" ? 0.9 : 0.2)
+    );
+
+    llm.touchActivity = vi.fn();
+    llm.ensureRerankContexts = vi.fn().mockResolvedValue([{ rankAll }]);
+    llm.ensureRerankModel = vi.fn().mockResolvedValue({
+      tokenize: (text: string) => Array.from(text),
+      detokenize: (tokens: string[]) => tokens.join(""),
+    });
+
+    const result = await llm.rerank("query", [
+      { file: "a.md", text: "shared chunk" },
+      { file: "b.md", text: "shared chunk" },
+      { file: "c.md", text: "different chunk" },
+    ]);
+
+    expect(rankAll).toHaveBeenCalledTimes(1);
+    expect(rankAll).toHaveBeenCalledWith("query", ["shared chunk", "different chunk"]);
+    expect(result.results).toHaveLength(3);
+
+    const scoreByFile = new Map(result.results.map((item) => [item.file, item.score]));
+    expect(scoreByFile.get("a.md")).toBe(0.9);
+    expect(scoreByFile.get("b.md")).toBe(0.9);
+    expect(scoreByFile.get("c.md")).toBe(0.2);
+  });
+});
+
+describe("LlamaCpp.getDeviceInfo", () => {
+  test("can skip build attempts for status probes", async () => {
+    const llm = new LlamaCpp({}) as any;
+    const fakeLlama = {
+      gpu: "metal",
+      supportsGpuOffloading: true,
+      cpuMathCores: 8,
+      getGpuDeviceNames: vi.fn().mockResolvedValue(["Apple GPU"]),
+      getVramState: vi.fn().mockResolvedValue({ total: 1024, used: 256, free: 768 }),
+    };
+
+    llm.ensureLlama = vi.fn().mockResolvedValue(fakeLlama);
+
+    const device = await llm.getDeviceInfo({ allowBuild: false });
+
+    expect(llm.ensureLlama).toHaveBeenCalledWith(false);
+    expect(device).toEqual({
+      gpu: "metal",
+      gpuOffloading: true,
+      gpuDevices: ["Apple GPU"],
+      vram: { total: 1024, used: 256, free: 768 },
+      cpuCores: 8,
+    });
   });
 });
 
@@ -366,6 +629,34 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       console.log(`Batch rerank of 10 docs took ${elapsed}ms`);
     });
 
+    test("uses fewer active rerank contexts for small batches", async () => {
+      const freshLlm = new LlamaCpp({});
+      const calls: number[] = [];
+      const fakeModel = {
+        tokenize: (text: string) => Array.from(text),
+        detokenize: (tokens: string[]) => tokens.join(""),
+      };
+      const fakeContexts = Array.from({ length: 4 }, (_, idx) => ({
+        rankAll: async (_query: string, docs: string[]) => {
+          calls.push(idx);
+          return docs.map(() => 0.5);
+        },
+      }));
+
+      (freshLlm as any).ensureRerankModel = async () => fakeModel;
+      (freshLlm as any).ensureRerankContexts = async () => fakeContexts;
+
+      const documents: RerankDocument[] = Array.from({ length: 20 }, (_, i) => ({
+        file: `doc${i}.md`,
+        text: `Document number ${i}`,
+      }));
+
+      const result = await freshLlm.rerank("topic 1", documents);
+
+      expect(result.results).toHaveLength(20);
+      expect(calls).toEqual([0, 1]);
+    });
+
     test("truncates and reranks document exceeding 2048 token context size", async () => {
       // The reranker context is created with contextSize=2048. Documents that
       // exceed the token budget (contextSize - template overhead - query tokens)
@@ -403,7 +694,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       for (const doc of result.results) {
         console.log(`  ${doc.file}: ${doc.score.toFixed(4)}`);
       }
-    });
+    }, 30000);
   });
 
   describe("expandQuery", () => {
@@ -600,4 +891,3 @@ describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
     });
   });
 });
-

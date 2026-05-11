@@ -1,11 +1,12 @@
-import { openDatabase } from "./db.js";
-import type { Database } from "./db.js";
+import { openDatabase } from "../db.js";
+import type { Database } from "../db.js";
 import fastGlob from "fast-glob";
 import { execSync, spawn as nodeSpawn } from "child_process";
 import { fileURLToPath } from "url";
-import { dirname, join as pathJoin } from "path";
+import { dirname, join as pathJoin, relative as relativePath, resolve as pathResolve } from "path";
 import { parseArgs } from "util";
-import { readFileSync, realpathSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync } from "fs";
+import { readFileSync, realpathSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync, lstatSync, rmSync, symlinkSync, readlinkSync } from "fs";
+import { createInterface } from "readline/promises";
 import {
   getPwd,
   getRealPath,
@@ -24,10 +25,8 @@ import {
   isDocid,
   matchFilesByGlob,
   getHashesNeedingEmbedding,
-  getHashesForEmbedding,
   clearAllEmbeddings,
   insertEmbedding,
-  insertEmbeddingBatch,
   getStatus,
   hashContent,
   extractTitle,
@@ -46,6 +45,7 @@ import {
   insertContent,
   insertDocument,
   findActiveDocument,
+  findOrMigrateLegacyDocument,
   updateDocumentTitle,
   updateDocument,
   deactivateDocument,
@@ -63,15 +63,22 @@ import {
   structuredSearch,
   addLineNumbers,
   type ExpandedQuery,
-  type StructuredSubSearch,
+  type HybridQueryExplain,
   DEFAULT_EMBED_MODEL,
+  DEFAULT_EMBED_MAX_BATCH_BYTES,
+  DEFAULT_EMBED_MAX_DOCS_PER_BATCH,
   DEFAULT_RERANK_MODEL,
   DEFAULT_GLOB,
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
   getDefaultDbPath,
-} from "./store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, getDefaultOllamaEmbed, printEmbedderStats } from "./llm.js";
+  reindexCollection,
+  generateEmbeddings,
+  syncConfigToDb,
+  type ReindexResult,
+  type ChunkStrategy,
+} from "../store.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -85,14 +92,21 @@ import {
   getDefaultCollectionNames,
   addContext as yamlAddContext,
   removeContext as yamlRemoveContext,
+  removeCollection as yamlRemoveCollectionFn,
+  renameCollection as yamlRenameCollectionFn,
   setGlobalContext,
   listAllContexts,
   setConfigIndexName,
-} from "./collections.js";
+  loadConfig,
+} from "../collections.js";
+import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
 
-// Enable production mode - allows using default database path
-// Tests must set INDEX_PATH or use createStore() with explicit path
-enableProductionMode();
+// NOTE: enableProductionMode() is intentionally NOT called at module scope here.
+// Importing this module for its exports (e.g. buildEditorUri, termLink from
+// test/cli.test.ts) must not flip the global production flag, as that leaks
+// into unrelated tests that rely on the default (development) database path
+// resolution. The flag is flipped inside the CLI's main-module guard below so
+// it only fires when qmd is actually invoked as a script.
 
 // =============================================================================
 // Store/DB lifecycle (no legacy singletons in store.ts)
@@ -100,16 +114,44 @@ enableProductionMode();
 
 let store: ReturnType<typeof createStore> | null = null;
 let storeDbPathOverride: string | undefined;
+let currentIndexName = "index";
 
 function getStore(): ReturnType<typeof createStore> {
   if (!store) {
     store = createStore(storeDbPathOverride);
+    // Sync YAML config into SQLite store_collections so store.ts reads from DB
+    try {
+      const config = loadConfig();
+      syncConfigToDb(store.db, config);
+      if (config.models) {
+        setDefaultLlamaCpp(new LlamaCpp({
+          embedModel: config.models.embed,
+          generateModel: config.models.generate,
+          rerankModel: config.models.rerank,
+        }));
+      }
+    } catch {
+      // Config may not exist yet — that's fine, DB works without it
+    }
   }
   return store;
 }
 
 function getDb(): Database {
   return getStore().db;
+}
+
+/** Re-sync YAML config into SQLite after CLI mutations (add/remove/rename collection, context changes) */
+function resyncConfig(): void {
+  const s = getStore();
+  try {
+    const config = loadConfig();
+    // Clear config hash to force re-sync
+    s.db.prepare(`DELETE FROM store_config WHERE key = 'config_hash'`).run();
+    syncConfigToDb(s.db, config);
+  } catch {
+    // Config may not exist — that's fine
+  }
 }
 
 function closeDb(): void {
@@ -123,16 +165,19 @@ function getDbPath(): string {
   return store?.dbPath ?? storeDbPathOverride ?? getDefaultDbPath();
 }
 
+function getActiveIndexName(): string {
+  return currentIndexName;
+}
+
 function setIndexName(name: string | null): void {
   let normalizedName = name;
   // Normalize relative paths to prevent malformed database paths
   if (name && name.includes('/')) {
-    const { resolve } = require('path');
-    const { cwd } = require('process');
-    const absolutePath = resolve(cwd(), name);
+    const absolutePath = pathResolve(process.cwd(), name);
     // Replace path separators with underscores to create a valid filename
     normalizedName = absolutePath.replace(/\//g, '_').replace(/^_/, '');
   }
+  currentIndexName = normalizedName || "index";
   storeDbPathOverride = normalizedName ? getDefaultDbPath(normalizedName) : undefined;
   // Reset open handle so next use opens the new index
   closeDb();
@@ -166,19 +211,20 @@ const cursor = {
 process.on('SIGINT', () => { cursor.show(); process.exit(130); });
 process.on('SIGTERM', () => { cursor.show(); process.exit(143); });
 
-// Terminal progress bar using OSC 9;4 escape sequence
+// Terminal progress bar using OSC 9;4 escape sequence (TTY only)
+const isTTY = process.stderr.isTTY;
 const progress = {
   set(percent: number) {
-    process.stderr.write(`\x1b]9;4;1;${Math.round(percent)}\x07`);
+    if (isTTY) process.stderr.write(`\x1b]9;4;1;${Math.round(percent)}\x07`);
   },
   clear() {
-    process.stderr.write(`\x1b]9;4;0\x07`);
+    if (isTTY) process.stderr.write(`\x1b]9;4;0\x07`);
   },
   indeterminate() {
-    process.stderr.write(`\x1b]9;4;3\x07`);
+    if (isTTY) process.stderr.write(`\x1b]9;4;3\x07`);
   },
   error() {
-    process.stderr.write(`\x1b]9;4;2\x07`);
+    if (isTTY) process.stderr.write(`\x1b]9;4;2\x07`);
   },
 };
 
@@ -342,6 +388,32 @@ async function showStatus(): Promise<void> {
     });
   }
 
+  // AST chunking status
+  try {
+    const { getASTStatus } = await import("../ast.js");
+    const ast = await getASTStatus();
+    console.log(`\n${c.bold}AST Chunking${c.reset}`);
+    if (ast.available) {
+      const ok = ast.languages.filter(l => l.available).map(l => l.language);
+      const fail = ast.languages.filter(l => !l.available);
+      console.log(`  Status:   ${c.green}active${c.reset}`);
+      console.log(`  Languages: ${ok.join(", ")}`);
+      if (fail.length > 0) {
+        for (const f of fail) {
+          console.log(`  ${c.yellow}Unavailable: ${f.language} (${f.error})${c.reset}`);
+        }
+      }
+    } else {
+      console.log(`  Status:   ${c.yellow}unavailable${c.reset} (falling back to regex chunking)`);
+      for (const l of ast.languages) {
+        if (l.error) console.log(`  ${c.dim}${l.language}: ${l.error}${c.reset}`);
+      }
+    }
+  } catch {
+    console.log(`\n${c.bold}AST Chunking${c.reset}`);
+    console.log(`  Status:   ${c.dim}not available${c.reset}`);
+  }
+
   if (collections.length > 0) {
     console.log(`\n${c.bold}Collections${c.reset}`);
     for (const col of collections) {
@@ -397,33 +469,41 @@ async function showStatus(): Promise<void> {
   }
 
   // Device / GPU info
-  try {
-    const llm = getDefaultLlamaCpp();
-    const device = await llm.getDeviceInfo();
+  // Important: probing node-llama-cpp can abort the whole process on machines with
+  // incompatible GPU drivers (for example Vulkan loader present but no usable driver).
+  // Keep `qmd status` safe by default and make the expensive/native probe opt-in.
+  if (process.env.QMD_STATUS_DEVICE_PROBE === "1") {
     console.log(`\n${c.bold}Device${c.reset}`);
-    if (device.gpu) {
-      console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
-      if (device.gpuDevices.length > 0) {
-        // Deduplicate and count GPUs
-        const counts = new Map<string, number>();
-        for (const name of device.gpuDevices) {
-          counts.set(name, (counts.get(name) || 0) + 1);
+    try {
+      const llm = getDefaultLlamaCpp();
+      const device = await llm.getDeviceInfo({ allowBuild: false });
+      if (device.gpu) {
+        console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
+        if (device.gpuDevices.length > 0) {
+          // Deduplicate and count GPUs
+          const counts = new Map<string, number>();
+          for (const name of device.gpuDevices) {
+            counts.set(name, (counts.get(name) || 0) + 1);
+          }
+          const deviceStr = Array.from(counts.entries())
+            .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
+            .join(', ');
+          console.log(`  Devices:  ${deviceStr}`);
         }
-        const deviceStr = Array.from(counts.entries())
-          .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
-          .join(', ');
-        console.log(`  Devices:  ${deviceStr}`);
+        if (device.vram) {
+          console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
+        }
+      } else {
+        console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
+        console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
       }
-      if (device.vram) {
-        console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
+      console.log(`  CPU:      ${device.cpuCores} math cores`);
+    } catch (error) {
+      console.log(`  Status:   ${c.dim}probe failed${c.reset}`);
+      if (error instanceof Error && error.message) {
+        console.log(`  ${c.dim}${error.message}${c.reset}`);
       }
-    } else {
-      console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
-      console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
     }
-    console.log(`  CPU:      ${device.cpuCores} math cores`);
-  } catch {
-    // Don't fail status if LLM init fails
   }
 
   // Tips section
@@ -466,6 +546,7 @@ async function showStatus(): Promise<void> {
 
 async function updateCollections(): Promise<void> {
   const db = getDb();
+  const storeInstance = getStore();
   // Collections are defined in YAML; no duplicate cleanup needed.
 
   // Clear Ollama cache on update
@@ -479,7 +560,6 @@ async function updateCollections(): Promise<void> {
     return;
   }
 
-  // Don't close db here - indexFiles will reuse it and close at the end
   console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
 
   for (let i = 0; i < collections.length; i++) {
@@ -523,13 +603,32 @@ async function updateCollections(): Promise<void> {
       }
     }
 
-    await indexFiles(col.pwd, col.glob_pattern, col.name, true);
+    const startTime = Date.now();
+    console.log(`Collection: ${col.pwd} (${col.glob_pattern})`);
+    progress.indeterminate();
+
+    const result = await reindexCollection(storeInstance, col.pwd, col.glob_pattern, col.name, {
+      ignorePatterns: yamlCol?.ignore,
+      onProgress: (info) => {
+        progress.set((info.current / info.total) * 100);
+        const elapsed = (Date.now() - startTime) / 1000;
+        const rate = info.current / elapsed;
+        const remaining = (info.total - info.current) / rate;
+        const eta = info.current > 2 ? ` ETA: ${formatETA(remaining)}` : "";
+        if (isTTY) process.stderr.write(`\rIndexing: ${info.current}/${info.total}${eta}        `);
+      },
+    });
+
+    progress.clear();
+    console.log(`\nIndexed: ${result.indexed} new, ${result.updated} updated, ${result.unchanged} unchanged, ${result.removed} removed`);
+    if (result.orphanedCleaned > 0) {
+      console.log(`Cleaned up ${result.orphanedCleaned} orphaned content hash(es)`);
+    }
     console.log("");
   }
 
   // Check if any documents need embedding (show once at end)
-  const finalDb = getDb();
-  const needsEmbedding = getHashesNeedingEmbedding(finalDb);
+  const needsEmbedding = getHashesNeedingEmbedding(db);
   closeDb();
 
   console.log(`${c.green}✓ All collections updated.${c.reset}`);
@@ -580,6 +679,7 @@ async function contextAdd(pathArg: string | undefined, contextText: string): Pro
   // Handle "/" as global context (applies to all collections)
   if (pathArg === '/') {
     setGlobalContext(contextText);
+    resyncConfig();
     console.log(`${c.green}✓${c.reset} Set global context`);
     console.log(`${c.dim}Context: ${contextText}${c.reset}`);
     closeDb();
@@ -611,6 +711,7 @@ async function contextAdd(pathArg: string | undefined, contextText: string): Pro
     }
 
     yamlAddContext(parsed.collectionName, parsed.path, contextText);
+    resyncConfig();
 
     const displayPath = parsed.path
       ? `qmd://${parsed.collectionName}/${parsed.path}`
@@ -630,6 +731,7 @@ async function contextAdd(pathArg: string | undefined, contextText: string): Pro
   }
 
   yamlAddContext(detected.collectionName, detected.relativePath, contextText);
+  resyncConfig();
 
   const displayPath = detected.relativePath ? `qmd://${detected.collectionName}/${detected.relativePath}` : `qmd://${detected.collectionName}/`;
   console.log(`${c.green}✓${c.reset} Added context for: ${displayPath}`);
@@ -669,6 +771,10 @@ function contextRemove(pathArg: string): void {
   if (pathArg === '/') {
     // Remove global context
     setGlobalContext(undefined);
+    // Resync so SQLite store_config is updated
+    const s = getStore();
+    resyncConfig();
+    closeDb();
     console.log(`${c.green}✓${c.reset} Removed global context`);
     return;
   }
@@ -728,8 +834,6 @@ function contextRemove(pathArg: string): void {
 }
 
 function getDocument(filename: string, fromLine?: number, maxLines?: number, lineNumbers?: boolean): void {
-  const db = getDb();
-
   // Parse :linenum suffix from filename (e.g., "file.md:100")
   let inputPath = filename;
   const colonMatch = inputPath.match(/:(\d+)$/);
@@ -740,6 +844,14 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
       inputPath = inputPath.slice(0, -colonMatch[0].length);
     }
   }
+
+  const parsedIndexPath = isVirtualPath(inputPath) ? parseVirtualPath(inputPath) : null;
+  if (parsedIndexPath?.indexName) {
+    setIndexName(parsedIndexPath.indexName);
+    setConfigIndexName(parsedIndexPath.indexName);
+  }
+
+  const db = getDb();
 
   // Handle docid lookup (#abc123, abc123, "#abc123", "abc123", etc.)
   if (isDocid(inputPath)) {
@@ -752,7 +864,6 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
       process.exit(1);
     }
   }
-
   let doc: { collectionName: string; path: string; body: string } | null = null;
   let virtualPath: string;
 
@@ -912,7 +1023,7 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
   const db = getDb();
 
   // Check if it's a comma-separated list or a glob pattern
-  const isCommaSeparated = pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?');
+  const isCommaSeparated = pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?') && !pattern.includes('{');
 
   let files: { filepath: string; displayPath: string; bodyLength: number; collection?: string; path?: string }[];
 
@@ -1307,6 +1418,9 @@ function collectionList(): void {
 
     console.log(`${c.cyan}${coll.name}${c.reset} ${c.dim}(qmd://${coll.name}/)${c.reset}${excludeTag}`);
     console.log(`  ${c.dim}Pattern:${c.reset}  ${coll.glob_pattern}`);
+    if (yamlColl?.ignore?.length) {
+      console.log(`  ${c.dim}Ignore:${c.reset}   ${yamlColl.ignore.join(', ')}`);
+    }
     console.log(`  ${c.dim}Files:${c.reset}    ${coll.active_count}`);
     console.log(`  ${c.dim}Updated:${c.reset}  ${timeAgo}`);
     console.log();
@@ -1343,13 +1457,15 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
     process.exit(1);
   }
 
-  // Add to YAML config
-  const { addCollection } = await import("./collections.js");
+  // Add to YAML config + sync to SQLite
+  const { addCollection } = await import("../collections.js");
   addCollection(collName, pwd, globPattern);
+  resyncConfig();
 
   // Create the collection and index files
   console.log(`Creating collection '${collName}'...`);
-  await indexFiles(pwd, globPattern, collName);
+  const newColl = getCollectionFromYaml(collName);
+  await indexFiles(pwd, globPattern, collName, false, newColl?.ignore);
   console.log(`${c.green}✓${c.reset} Collection '${collName}' created successfully`);
 }
 
@@ -1364,6 +1480,8 @@ function collectionRemove(name: string): void {
 
   const db = getDb();
   const result = removeCollection(db, name);
+  // Also remove from YAML config
+  yamlRemoveCollectionFn(name);
   closeDb();
 
   console.log(`${c.green}✓${c.reset} Removed collection '${name}'`);
@@ -1392,13 +1510,15 @@ function collectionRename(oldName: string, newName: string): void {
 
   const db = getDb();
   renameCollection(db, oldName, newName);
+  // Also rename in YAML config
+  yamlRenameCollectionFn(oldName, newName);
   closeDb();
 
   console.log(`${c.green}✓${c.reset} Renamed collection '${oldName}' to '${newName}'`);
   console.log(`  Virtual paths updated: ${c.cyan}qmd://${oldName}/${c.reset} → ${c.cyan}qmd://${newName}/${c.reset}`);
 }
 
-async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false): Promise<void> {
+async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false, ignorePatterns?: string[]): Promise<void> {
   const db = getDb();
   const resolvedPwd = pwd || getPwd();
   const now = new Date().toISOString();
@@ -1415,12 +1535,16 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   console.log(`Collection: ${resolvedPwd} (${globPattern})`);
 
   progress.indeterminate();
+  const allIgnore = [
+    ...excludeDirs.map(d => `**/${d}/**`),
+    ...(ignorePatterns || []),
+  ];
   const allFiles: string[] = await fastGlob(globPattern, {
     cwd: resolvedPwd,
     onlyFiles: true,
     followSymbolicLinks: false,
     dot: false,
-    ignore: excludeDirs.map(d => `**/${d}/**`),
+    ignore: allIgnore,
   });
   // Filter hidden files/folders (dot: false handles top-level but not nested)
   const files = allFiles.filter(file => {
@@ -1429,11 +1553,11 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   });
 
   const total = files.length;
-  if (total === 0) {
+  const hasNoFiles = total === 0;
+  if (hasNoFiles) {
     progress.clear();
     console.log("No files found matching pattern.");
-    closeDb();
-    return;
+    // Continue so the deactivation pass can mark previously indexed docs as inactive.
   }
 
   let indexed = 0, updated = 0, unchanged = 0, processed = 0;
@@ -1445,7 +1569,15 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     const path = handelize(relativeFile); // Normalize path for token-friendliness
     seenPaths.add(path);
 
-    const content = readFileSync(filepath, "utf-8");
+    let content: string;
+    try {
+      content = readFileSync(filepath, "utf-8");
+    } catch (err: any) {
+      // Skip files that can't be read (e.g. iCloud evicted files returning EAGAIN)
+      processed++;
+      progress.set((processed / total) * 100);
+      continue;
+    }
 
     // Skip empty files - nothing useful to index
     if (!content.trim()) {
@@ -1456,8 +1588,8 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     const hash = await hashContent(content);
     const title = extractTitle(content, relativeFile);
 
-    // Check if document exists in this collection with this path
-    const existing = findActiveDocument(db, collectionName, path);
+    // Check if document exists (also migrates legacy lowercase paths)
+    const existing = findOrMigrateLegacyDocument(db, collectionName, path);
 
     if (existing) {
       if (existing.hash === hash) {
@@ -1492,7 +1624,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     const rate = processed / elapsed;
     const remaining = (total - processed) / rate;
     const eta = processed > 2 ? ` ETA: ${formatETA(remaining)}` : "";
-    process.stderr.write(`\rIndexing: ${processed}/${total}${eta}        `);
+    if (isTTY) process.stderr.write(`\rIndexing: ${processed}/${total}${eta}        `);
   }
 
   // Deactivate documents in this collection that no longer exist
@@ -1531,227 +1663,97 @@ function renderProgressBar(percent: number, width: number = 30): string {
   return bar;
 }
 
-async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean = false): Promise<void> {
-  const db = getDb();
-  const now = new Date().toISOString();
+function parseEmbedBatchOption(name: string, value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return parsed;
+}
 
-  // If force, clear all vectors
+function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
+  if (value === undefined) return undefined;
+  const s = String(value);
+  if (s === "auto" || s === "regex") return s;
+  throw new Error(`--chunk-strategy must be "auto" or "regex" (got "${s}")`);
+}
+
+export function resolveEmbedModelForCli(): string {
+  return process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL_URI;
+}
+
+async function vectorIndex(
+  model: string = resolveEmbedModelForCli(),
+  force: boolean = false,
+  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collection?: string },
+): Promise<void> {
+  const storeInstance = getStore();
+  const db = storeInstance.db;
+
   if (force) {
     console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
-    clearAllEmbeddings(db);
   }
 
-  // Find unique hashes that need embedding (from active documents)
-  const hashesToEmbed = getHashesForEmbedding(db);
-
-  if (hashesToEmbed.length === 0) {
+  // Check if there's work to do before starting
+  const hashesToEmbed = getHashesNeedingEmbedding(db, batchOptions?.collection);
+  if (hashesToEmbed === 0 && !force) {
     console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
     closeDb();
     return;
   }
 
-  // Prepare documents with chunks
-  type ChunkItem = { hash: string; title: string; text: string; seq: number; pos: number; tokens: number; bytes: number; displayName: string };
-  const allChunks: ChunkItem[] = [];
-  let multiChunkDocs = 0;
-
-  // Chunk all documents using actual token counts
-  process.stderr.write(`Chunking ${hashesToEmbed.length} documents by token count...\n`);
-  for (const item of hashesToEmbed) {
-    const encoder = new TextEncoder();
-    const bodyBytes = encoder.encode(item.body).length;
-    if (bodyBytes === 0) continue; // Skip empty
-
-    const title = extractTitle(item.body, item.path);
-    const displayName = item.path;
-    const chunks = await chunkDocumentByTokens(item.body);  // Uses actual tokenizer
-
-    if (chunks.length > 1) multiChunkDocs++;
-
-    for (let seq = 0; seq < chunks.length; seq++) {
-      allChunks.push({
-        hash: item.hash,
-        title,
-        text: chunks[seq]!.text, // Chunk is guaranteed to exist by seq loop
-        seq,
-        pos: chunks[seq]!.pos,
-        tokens: chunks[seq]!.tokens,
-        bytes: encoder.encode(chunks[seq]!.text).length,
-        displayName,
-      });
-    }
+  console.log(`${c.dim}Model: ${model}${c.reset}\n`);
+  if (batchOptions?.maxDocsPerBatch !== undefined || batchOptions?.maxBatchBytes !== undefined) {
+    const maxDocsPerBatch = batchOptions.maxDocsPerBatch ?? DEFAULT_EMBED_MAX_DOCS_PER_BATCH;
+    const maxBatchBytes = batchOptions.maxBatchBytes ?? DEFAULT_EMBED_MAX_BATCH_BYTES;
+    console.log(`${c.dim}Batch: ${maxDocsPerBatch} docs / ${formatBytes(maxBatchBytes)}${c.reset}\n`);
   }
-
-  if (allChunks.length === 0) {
-    console.log(`${c.green}✓ No non-empty documents to embed.${c.reset}`);
-    closeDb();
-    return;
-  }
-
-  const totalBytes = allChunks.reduce((sum, chk) => sum + chk.bytes, 0);
-  const totalChunks = allChunks.length;
-  const totalDocs = hashesToEmbed.length;
-
-  // Hide cursor during embedding
   cursor.hide();
+  progress.indeterminate();
 
-  // Try Ollama first (multi-server, GPU-accelerated), fall back to LlamaCpp
-  const useOllama = process.env.QMD_EMBED_BACKEND !== 'llamacpp';
+  const startTime = Date.now();
 
-  if (useOllama) {
-    // --- Ollama backend: multi-server, work-stealing, streaming ---
-    const ollama = getDefaultOllamaEmbed();
-
-    // Probe servers (warms models, detects dimensions)
-    progress.indeterminate();
-    await ollama.embedBatch(["init"]);
-    const dims = ollama.getDimensions();
-    if (!dims) {
-      throw new Error("Failed to detect embedding dimensions from Ollama probe");
-    }
-
-    console.log(`${c.bold}Embedding ${totalDocs} docs${c.reset} ${c.dim}(${totalChunks} chunks, ${formatBytes(totalBytes)}) · ${model}${c.reset}`);
-
-    ensureVecTable(db, dims);
-    const allTexts = allChunks.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
-
-    let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
-    const startTime = Date.now();
-
-    // Single-line live display, redrawn on a throttled timer (not per-callback).
-    // Multiple server callbacks race; per-callback drawing produced interleaved output
-    // and non-monotonic counts in the scrollback. Timer-driven rendering avoids both.
-    const isTTY = Boolean(process.stderr.isTTY);
-    const render = () => {
-      const percent = totalBytes > 0 ? (bytesProcessed / totalBytes) * 100 : 0;
+  const result = await generateEmbeddings(storeInstance, {
+    force,
+    model,
+    collection: batchOptions?.collection,
+    maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
+    maxBatchBytes: batchOptions?.maxBatchBytes,
+    chunkStrategy: batchOptions?.chunkStrategy,
+    onProgress: (info) => {
+      if (info.totalBytes === 0) return;
+      const percent = (info.bytesProcessed / info.totalBytes) * 100;
       progress.set(percent);
+
       const elapsed = (Date.now() - startTime) / 1000;
-      const bytesPerSec = elapsed > 0 ? bytesProcessed / elapsed : 0;
-      const remainingBytes = totalBytes - bytesProcessed;
-      const etaSec = bytesPerSec > 0 ? remainingBytes / bytesPerSec : 0;
+      const bytesPerSec = info.bytesProcessed / elapsed;
+      const remainingBytes = info.totalBytes - info.bytesProcessed;
+      const etaSec = remainingBytes / bytesPerSec;
 
       const bar = renderProgressBar(percent);
       const percentStr = percent.toFixed(0).padStart(3);
       const throughput = `${formatBytes(bytesPerSec)}/s`;
       const eta = elapsed > 2 ? formatETA(etaSec) : "...";
-      const errStr = errors > 0 ? ` ${c.yellow}${errors} err${c.reset}` : "";
+      const errStr = info.errors > 0 ? ` ${c.yellow}${info.errors} err${c.reset}` : "";
 
-      const line = `${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${chunksEmbedded}/${totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}`;
-      if (isTTY) {
-        process.stderr.write(`\r\x1b[K${line}`);
-      }
-    };
+      if (isTTY) process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${info.chunksEmbedded}/${info.totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
+    },
+  });
 
-    const renderTimer = isTTY ? setInterval(render, 250) : null;
+  progress.clear();
+  cursor.show();
 
-    try {
-      await ollama.embedStream(allTexts, (startIdx, results) => {
-        const dbBatch: { hash: string; seq: number; pos: number; embedding: Float32Array; model: string; embeddedAt: string }[] = [];
-        for (let i = 0; i < results.length; i++) {
-          const chunkIdx = startIdx + i;
-          const chunk = allChunks[chunkIdx]!;
-          const embedding = results[i];
-          if (embedding) {
-            dbBatch.push({ hash: chunk.hash, seq: chunk.seq, pos: chunk.pos, embedding: new Float32Array(embedding.embedding), model, embeddedAt: now });
-            chunksEmbedded++;
-          } else {
-            errors++;
-          }
-          bytesProcessed += chunk.bytes;
-        }
-        insertEmbeddingBatch(db, dbBatch);
-        // No drawing here — render() runs on its own timer.
-      });
-    } finally {
-      if (renderTimer) clearInterval(renderTimer);
-    }
+  const totalTimeSec = result.durationMs / 1000;
 
-    progress.clear();
-    cursor.show();
-    const totalTimeSec = (Date.now() - startTime) / 1000;
-    const avgThroughput = formatBytes(totalBytes / totalTimeSec);
-
-    if (isTTY) process.stderr.write(`\r\x1b[K`);
-    console.log(`${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}`);
-    console.log(`${c.green}✓ Done!${c.reset} Embedded ${c.bold}${chunksEmbedded}${c.reset} chunks from ${c.bold}${totalDocs}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset} ${c.dim}(${avgThroughput}/s)${c.reset}`);
-    if (errors > 0) {
-      console.log(`${c.yellow}⚠ ${errors} chunks failed${c.reset}`);
-    }
-    printEmbedderStats();
+  if (result.chunksEmbedded === 0 && result.docsProcessed === 0) {
+    console.log(`${c.green}✓ No non-empty documents to embed.${c.reset}`);
   } else {
-    // --- LlamaCpp backend: original single-GPU path ---
-    console.log(`${c.bold}Embedding ${totalDocs} documents${c.reset} ${c.dim}(${totalChunks} chunks, ${formatBytes(totalBytes)})${c.reset}`);
-    if (multiChunkDocs > 0) {
-      console.log(`${c.dim}${multiChunkDocs} documents split into multiple chunks${c.reset}`);
+    console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
+    console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${result.chunksEmbedded}${c.reset} chunks from ${c.bold}${result.docsProcessed}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset}`);
+    if (result.errors > 0) {
+      console.log(`${c.yellow}⚠ ${result.errors} chunks failed${c.reset}`);
     }
-    console.log(`${c.dim}Model: ${model}${c.reset}\n`);
-
-    await withLLMSession(async (session) => {
-      progress.indeterminate();
-      const firstChunk = allChunks[0];
-      if (!firstChunk) throw new Error("No chunks available to embed");
-      const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
-      const firstResult = await session.embed(firstText);
-      if (!firstResult) throw new Error("Failed to get embedding dimensions from first chunk");
-      ensureVecTable(db, firstResult.embedding.length);
-
-      let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
-      const startTime = Date.now();
-      const BATCH_SIZE = 32;
-
-      for (let batchStart = 0; batchStart < allChunks.length; batchStart += BATCH_SIZE) {
-        const batchEnd = Math.min(batchStart + BATCH_SIZE, allChunks.length);
-        const batch = allChunks.slice(batchStart, batchEnd);
-        const texts = batch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
-
-        try {
-          const embeddings = await session.embedBatch(texts);
-          for (let i = 0; i < batch.length; i++) {
-            const chunk = batch[i]!;
-            const embedding = embeddings[i];
-            if (embedding) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
-              chunksEmbedded++;
-            } else {
-              errors++;
-            }
-            bytesProcessed += chunk.bytes;
-          }
-        } catch (err) {
-          for (const chunk of batch) {
-            try {
-              const text = formatDocForEmbedding(chunk.text, chunk.title);
-              const result = await session.embed(text);
-              if (result) {
-                insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
-                chunksEmbedded++;
-              } else { errors++; }
-            } catch { errors++; }
-            bytesProcessed += chunk.bytes;
-          }
-        }
-
-        const percent = (bytesProcessed / totalBytes) * 100;
-        progress.set(percent);
-        const elapsed = (Date.now() - startTime) / 1000;
-        const bytesPerSec = bytesProcessed / elapsed;
-        const etaSec = (totalBytes - bytesProcessed) / bytesPerSec;
-        const bar = renderProgressBar(percent);
-        const percentStr = percent.toFixed(0).padStart(3);
-        const throughput = `${formatBytes(bytesPerSec)}/s`;
-        const eta = elapsed > 2 ? formatETA(etaSec) : "...";
-        const errStr = errors > 0 ? ` ${c.yellow}${errors} err${c.reset}` : "";
-        process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${chunksEmbedded}/${totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
-      }
-
-      progress.clear();
-      cursor.show();
-      const totalTimeSec = (Date.now() - startTime) / 1000;
-      const avgThroughput = formatBytes(totalBytes / totalTimeSec);
-      console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
-      console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${chunksEmbedded}${c.reset} chunks from ${c.bold}${totalDocs}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset} ${c.dim}(${avgThroughput}/s)${c.reset}`);
-      if (errors > 0) console.log(`${c.yellow}⚠ ${errors} chunks failed${c.reset}`);
-    }, { maxDuration: 30 * 60 * 1000, name: 'embed-command' });
   }
 
   closeDb();
@@ -1807,7 +1809,12 @@ type OutputOptions = {
   all?: boolean;
   collection?: string | string[];  // Filter by collection name(s)
   lineNumbers?: boolean; // Add line numbers to output
+  explain?: boolean;     // Include retrieval score traces (query only)
   context?: string;      // Optional context for query expansion
+  candidateLimit?: number;  // Max candidates to rerank (default: 40)
+  intent?: string;       // Domain intent for disambiguation
+  skipRerank?: boolean;  // Skip LLM reranking, use RRF scores only
+  chunkStrategy?: ChunkStrategy;  // "auto" (default) or "regex"
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -1831,6 +1838,10 @@ function formatScore(score: number): string {
   return `${c.dim}${pct}%${c.reset}`;
 }
 
+function formatExplainNumber(value: number): string {
+  return value.toFixed(4);
+}
+
 // Shorten directory path for display - relative to $HOME (used for context paths, not documents)
 function shortPath(dirpath: string): string {
   const home = homedir();
@@ -1840,23 +1851,126 @@ function shortPath(dirpath: string): string {
   return dirpath;
 }
 
-function outputResults(results: { file: string; displayPath: string; title: string; body: string; score: number; context?: string | null; chunkPos?: number; hash?: string; docid?: string }[], query: string, opts: OutputOptions): void {
+type EmptySearchReason = "no_results" | "min_score";
+
+// Emit format-safe empty output for search commands.
+function printEmptySearchResults(format: OutputFormat, reason: EmptySearchReason = "no_results"): void {
+  if (format === "json") {
+    console.log("[]");
+    return;
+  }
+  if (format === "csv") {
+    console.log("docid,score,file,title,context,line,snippet");
+    return;
+  }
+  if (format === "xml") {
+    console.log("<results></results>");
+    return;
+  }
+  if (format === "md" || format === "files") {
+    return;
+  }
+
+  if (reason === "min_score") {
+    console.log("No results found above minimum score threshold.");
+    return;
+  }
+  console.log("No results found.");
+}
+
+type OutputRow = {
+  file: string;
+  displayPath: string;
+  title: string;
+  body: string;
+  score: number;
+  context?: string | null;
+  chunkPos?: number;
+  hash?: string;
+  docid?: string;
+  explain?: HybridQueryExplain;
+};
+
+const DEFAULT_EDITOR_URI_TEMPLATE = "vscode://file/{path}:{line}:{col}";
+
+function encodePathForEditorUri(absolutePath: string): string {
+  return encodeURI(absolutePath)
+    .replace(/\?/g, "%3F")
+    .replace(/#/g, "%23");
+}
+
+function getEditorUriTemplate(): string {
+  const envTemplate = process.env.QMD_EDITOR_URI?.trim();
+  if (envTemplate) return envTemplate;
+
+  try {
+    const config = loadConfig() as unknown as {
+      editor_uri?: string;
+      editor_uri_template?: string;
+      editorUri?: string;
+      [key: string]: unknown;
+    };
+    const configTemplate = (
+      config.editor_uri
+      || config.editor_uri_template
+      || config.editorUri
+      || (typeof config["editor-uri"] === "string" ? config["editor-uri"] : undefined)
+    )?.trim();
+
+    if (configTemplate) return configTemplate;
+  } catch {
+    // Ignore config parsing issues and use default template.
+  }
+
+  return DEFAULT_EDITOR_URI_TEMPLATE;
+}
+
+export function buildEditorUri(template: string, absolutePath: string, line: number, col: number): string {
+  const safeLine = Number.isFinite(line) && line > 0 ? Math.floor(line) : 1;
+  const safeCol = Number.isFinite(col) && col > 0 ? Math.floor(col) : 1;
+  const encodedPath = encodePathForEditorUri(absolutePath);
+
+  return template
+    .replace(/\{path\}/g, encodedPath)
+    .replace(/\{line\}/g, String(safeLine))
+    .replace(/\{col\}/g, String(safeCol))
+    .replace(/\{column\}/g, String(safeCol));
+}
+
+export function termLink(text: string, url: string, isTTY: boolean = !!process.stdout.isTTY): string {
+  if (!isTTY) return text;
+  return `\x1b]8;;${url}\x07${text}\x1b]8;;\x07`;
+}
+
+function outputResults(results: OutputRow[], query: string, opts: OutputOptions): void {
   const filtered = results.filter(r => r.score >= opts.minScore).slice(0, opts.limit);
 
   if (filtered.length === 0) {
-    console.log("No results found above minimum score threshold.");
+    printEmptySearchResults(opts.format, "min_score");
     return;
   }
 
   // Helper to create qmd:// URI from displayPath
-  const toQmdPath = (displayPath: string) => `qmd://${displayPath}`;
+  const toQmdPath = (displayPath: string) => {
+    const [collectionName, ...segments] = displayPath.split("/");
+    if (!collectionName || segments.length === 0) {
+      return `qmd://${displayPath}`;
+    }
+    const indexName = getActiveIndexName();
+    return buildVirtualPath(
+      collectionName,
+      segments.join("/"),
+      indexName === "index" ? undefined : indexName,
+    );
+  };
 
   if (opts.format === "json") {
     // JSON output for LLM consumption
     const output = filtered.map(row => {
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
       let body = opts.full ? row.body : undefined;
-      let snippet = !opts.full ? extractSnippet(row.body, query, 300, row.chunkPos).snippet : undefined;
+      const snippetInfo = !opts.full ? extractSnippet(row.body, query, 300, row.chunkPos, undefined, opts.intent) : undefined;
+      let snippet = snippetInfo?.snippet;
       if (opts.lineNumbers) {
         if (body) body = addLineNumbers(body);
         if (snippet) snippet = addLineNumbers(snippet);
@@ -1865,10 +1979,12 @@ function outputResults(results: { file: string; displayPath: string; title: stri
         ...(docid && { docid: `#${docid}` }),
         score: Math.round(row.score * 100) / 100,
         file: toQmdPath(row.displayPath),
+        ...(snippetInfo && { line: snippetInfo.line }),
         title: row.title,
         ...(row.context && { context: row.context }),
         ...(body && { body }),
         ...(snippet && { snippet }),
+        ...(opts.explain && row.explain && { explain: row.explain }),
       };
     });
     console.log(JSON.stringify(output, null, 2));
@@ -1880,20 +1996,37 @@ function outputResults(results: { file: string; displayPath: string; title: stri
       console.log(`#${docid},${row.score.toFixed(2)},${toQmdPath(row.displayPath)}${ctx}`);
     }
   } else if (opts.format === "cli") {
+    const editorUriTemplate = getEditorUriTemplate();
+    const linkDb = getDb();
+
     for (let i = 0; i < filtered.length; i++) {
       const row = filtered[i];
       if (!row) continue;
-      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
+      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos, undefined, opts.intent);
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
 
       // Line 1: filepath with docid
-      const path = toQmdPath(row.displayPath);
+      const virtualPath = row.file.startsWith("qmd://") ? row.file : toQmdPath(row.displayPath);
+      const parsed = parseVirtualPath(virtualPath);
+      const absolutePath = resolveVirtualPath(linkDb, virtualPath);
+
+      const legacyPath = toQmdPath(row.displayPath);
+      const displayPath = parsed?.path || row.displayPath;
+
       // Only show :line if we actually found a term match in the snippet body (exclude header line).
       const snippetBody = snippet.split("\n").slice(1).join("\n").toLowerCase();
       const hasMatch = query.toLowerCase().split(/\s+/).some(t => t.length > 0 && snippetBody.includes(t));
       const lineInfo = hasMatch ? `:${line}` : "";
       const docidStr = docid ? ` ${c.dim}#${docid}${c.reset}` : "";
-      console.log(`${c.cyan}${path}${c.dim}${lineInfo}${c.reset}${docidStr}`);
+
+      if (process.stdout.isTTY && absolutePath && parsed?.path) {
+        const linkLine = hasMatch ? line : 1;
+        const linkTarget = buildEditorUri(editorUriTemplate, absolutePath, linkLine, 1);
+        const clickable = termLink(`${displayPath}${lineInfo}`, linkTarget);
+        console.log(`${c.cyan}${clickable}${c.reset}${docidStr}`);
+      } else {
+        console.log(`${c.cyan}${legacyPath}${c.dim}${lineInfo}${c.reset}${docidStr}`);
+      }
 
       // Line 2: Title (if available)
       if (row.title) {
@@ -1908,6 +2041,28 @@ function outputResults(results: { file: string; displayPath: string; title: stri
       // Line 4: Score
       const score = formatScore(row.score);
       console.log(`Score: ${c.bold}${score}${c.reset}`);
+      if (opts.explain && row.explain) {
+        const explain = row.explain;
+        const ftsScores = explain.ftsScores.length > 0
+          ? explain.ftsScores.map(formatExplainNumber).join(", ")
+          : "none";
+        const vecScores = explain.vectorScores.length > 0
+          ? explain.vectorScores.map(formatExplainNumber).join(", ")
+          : "none";
+        const contribSummary = explain.rrf.contributions
+          .slice()
+          .sort((a, b) => b.rrfContribution - a.rrfContribution)
+          .slice(0, 3)
+          .map(c => `${c.source}/${c.queryType}#${c.rank}:${formatExplainNumber(c.rrfContribution)}`)
+          .join(" | ");
+
+        console.log(`${c.dim}Explain: fts=[${ftsScores}] vec=[${vecScores}]${c.reset}`);
+        console.log(`${c.dim}  RRF: total=${formatExplainNumber(explain.rrf.totalScore)} base=${formatExplainNumber(explain.rrf.baseScore)} bonus=${formatExplainNumber(explain.rrf.topRankBonus)} rank=${explain.rrf.rank}${c.reset}`);
+        console.log(`${c.dim}  Blend: ${Math.round(explain.rrf.weight * 100)}%*${formatExplainNumber(explain.rrf.positionScore)} + ${Math.round((1 - explain.rrf.weight) * 100)}%*${formatExplainNumber(explain.rerankScore)} = ${formatExplainNumber(explain.blendedScore)}${c.reset}`);
+        if (contribSummary.length > 0) {
+          console.log(`${c.dim}  Top RRF contributions: ${contribSummary}${c.reset}`);
+        }
+      }
       console.log();
 
       // Snippet with highlighting (diff-style header included)
@@ -1924,7 +2079,7 @@ function outputResults(results: { file: string; displayPath: string; title: stri
       if (!row) continue;
       const heading = row.title || row.displayPath;
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
-      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos).snippet;
+      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos, undefined, opts.intent).snippet;
       if (opts.lineNumbers) {
         content = addLineNumbers(content);
       }
@@ -1937,7 +2092,7 @@ function outputResults(results: { file: string; displayPath: string; title: stri
       const titleAttr = row.title ? ` title="${row.title.replace(/"/g, '&quot;')}"` : "";
       const contextAttr = row.context ? ` context="${row.context.replace(/"/g, '&quot;')}"` : "";
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
-      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos).snippet;
+      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos, undefined, opts.intent).snippet;
       if (opts.lineNumbers) {
         content = addLineNumbers(content);
       }
@@ -1947,7 +2102,7 @@ function outputResults(results: { file: string; displayPath: string; title: stri
     // CSV format
     console.log("docid,score,file,title,context,line,snippet");
     for (const row of filtered) {
-      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
+      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos, undefined, opts.intent);
       let content = opts.full ? row.body : snippet;
       if (opts.lineNumbers) {
         content = addLineNumbers(content, line);
@@ -1997,7 +2152,7 @@ function filterByCollections<T extends { filepath?: string; file?: string }>(res
  * Plain lines without prefix go through query expansion.
  * 
  * Returns null if this is a plain query (single line, no prefix).
- * Returns StructuredSubSearch[] if structured syntax detected.
+ * Returns ExpandedQuery[] if structured syntax detected.
  * Throws if multiple plain lines (ambiguous).
  * 
  * Examples:
@@ -2006,7 +2161,12 @@ function filterByCollections<T extends { filepath?: string; file?: string }>(res
  *   "lex: CAP\nvec: consistency"     -> [{ type: 'lex', ... }, { type: 'vec', ... }]
  *   "CAP\nconsistency"               -> throws (multiple plain lines)
  */
-function parseStructuredQuery(query: string): StructuredSubSearch[] | null {
+interface ParsedStructuredQuery {
+  searches: ExpandedQuery[];
+  intent?: string;
+}
+
+function parseStructuredQuery(query: string): ParsedStructuredQuery | null {
   const rawLines = query.split('\n').map((line, idx) => ({
     raw: line,
     trimmed: line.trim(),
@@ -2017,7 +2177,9 @@ function parseStructuredQuery(query: string): StructuredSubSearch[] | null {
 
   const prefixRe = /^(lex|vec|hyde):\s*/i;
   const expandRe = /^expand:\s*/i;
-  const typed: StructuredSubSearch[] = [];
+  const intentRe = /^intent:\s*/i;
+  const typed: ExpandedQuery[] = [];
+  let intent: string | undefined;
 
   for (const line of rawLines) {
     if (expandRe.test(line.trimmed)) {
@@ -2029,6 +2191,19 @@ function parseStructuredQuery(query: string): StructuredSubSearch[] | null {
         throw new Error('expand: query must include text.');
       }
       return null; // treat as standalone expand query
+    }
+
+    // Parse intent: lines
+    if (intentRe.test(line.trimmed)) {
+      if (intent !== undefined) {
+        throw new Error(`Line ${line.number}: only one intent: line is allowed per query document.`);
+      }
+      const text = line.trimmed.replace(intentRe, '').trim();
+      if (!text) {
+        throw new Error(`Line ${line.number}: intent: must include text.`);
+      }
+      intent = text;
+      continue;
     }
 
     const match = line.trimmed.match(prefixRe);
@@ -2050,10 +2225,15 @@ function parseStructuredQuery(query: string): StructuredSubSearch[] | null {
       return null;
     }
 
-    throw new Error(`Line ${line.number} is missing a lex:/vec:/hyde: prefix. Each line in a query document must start with one.`);
+    throw new Error(`Line ${line.number} is missing a lex:/vec:/hyde:/intent: prefix. Each line in a query document must start with one.`);
   }
 
-  return typed.length > 0 ? typed : null;
+  // intent: alone is not a valid query — must have at least one search
+  if (intent && typed.length === 0) {
+    throw new Error('intent: cannot appear alone. Add at least one lex:, vec:, or hyde: line.');
+  }
+
+  return typed.length > 0 ? { searches: typed, intent } : null;
 }
 
 function search(query: string, opts: OutputOptions): void {
@@ -2086,11 +2266,7 @@ function search(query: string, opts: OutputOptions): void {
   closeDb();
 
   if (resultsWithContext.length === 0) {
-    if (opts.format === "json") {
-      console.log("[]");
-    } else {
-      console.log("No results found.");
-    }
+    printEmptySearchResults(opts.format);
     return;
   }
   outputResults(resultsWithContext, query, opts);
@@ -2101,7 +2277,7 @@ function logExpansionTree(originalQuery: string, expanded: ExpandedQuery[]): voi
   const lines: string[] = [];
   lines.push(`${c.dim}├─ ${originalQuery}${c.reset}`);
   for (const q of expanded) {
-    let preview = q.text.replace(/\n/g, ' ');
+    let preview = q.query.replace(/\n/g, ' ');
     if (preview.length > 72) preview = preview.substring(0, 69) + '...';
     lines.push(`${c.dim}├─ ${q.type}: ${preview}${c.reset}`);
   }
@@ -2126,6 +2302,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       collection: singleCollection,
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
+      intent: opts.intent,
       hooks: {
         onExpand: (original, expanded) => {
           logExpansionTree(original, expanded);
@@ -2145,11 +2322,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
     closeDb();
 
     if (results.length === 0) {
-      if (opts.format === "json") {
-        console.log("[]");
-      } else {
-        console.log("No results found.");
-      }
+      printEmptySearchResults(opts.format);
       return;
     }
 
@@ -2175,17 +2348,23 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
 
   checkIndexHealth(store.db);
 
-  // Check for structured query syntax (lex:/vec:/hyde: prefixes)
-  const structuredQueries = parseStructuredQuery(query);
+  // Check for structured query syntax (lex:/vec:/hyde:/intent: prefixes)
+  const parsed = parseStructuredQuery(query);
+  // Intent can come from --intent flag or from intent: line in query document
+  const intent = opts.intent || parsed?.intent;
 
   await withLLMSession(async () => {
     let results;
 
-    if (structuredQueries) {
+    if (parsed) {
+      const structuredQueries = parsed.searches;
       // Structured search — user provided their own query expansions
       const typeLabels = structuredQueries.map(s => s.type).join('+');
       process.stderr.write(`${c.dim}Structured search: ${structuredQueries.length} queries (${typeLabels})${c.reset}\n`);
-      
+      if (intent) {
+        process.stderr.write(`${c.dim}├─ intent: ${intent}${c.reset}\n`);
+      }
+
       // Log each sub-query
       for (const s of structuredQueries) {
         let preview = s.query.replace(/\n/g, ' ');
@@ -2198,6 +2377,11 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         collections: singleCollection ? [singleCollection] : undefined,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
+        candidateLimit: opts.candidateLimit,
+        skipRerank: opts.skipRerank,
+        explain: !!opts.explain,
+        intent,
+        chunkStrategy: opts.chunkStrategy,
         hooks: {
           onEmbedStart: (count) => {
             process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
@@ -2221,6 +2405,11 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         collection: singleCollection,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
+        candidateLimit: opts.candidateLimit,
+        skipRerank: opts.skipRerank,
+        explain: !!opts.explain,
+        intent,
+        chunkStrategy: opts.chunkStrategy,
         hooks: {
           onStrongSignal: (score) => {
             process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
@@ -2262,15 +2451,12 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
     closeDb();
 
     if (results.length === 0) {
-      if (opts.format === "json") {
-        console.log("[]");
-      } else {
-        console.log("No results found.");
-      }
+      printEmptySearchResults(opts.format);
       return;
     }
 
     // Use first lex/vec query for output context, or original query
+    const structuredQueries = parsed?.searches;
     const displayQuery = structuredQueries
       ? (structuredQueries.find(s => s.type === 'lex')?.query || structuredQueries.find(s => s.type === 'vec')?.query || query)
       : query;
@@ -2285,6 +2471,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       score: r.score,
       context: r.context,
       docid: r.docid,
+      explain: r.explain,
     })), displayQuery, { ...opts, limit: results.length });
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
 }
@@ -2304,6 +2491,8 @@ function parseCLI() {
       help: { type: "boolean", short: "h" },
       version: { type: "boolean", short: "v" },
       skill: { type: "boolean" },
+      global: { type: "boolean" },
+      yes: { type: "boolean" },
       // Search options
       n: { type: "string" },
       "min-score": { type: "string" },
@@ -2314,12 +2503,15 @@ function parseCLI() {
       xml: { type: "boolean" },
       files: { type: "boolean" },
       json: { type: "boolean" },
+      explain: { type: "boolean" },
       collection: { type: "string", short: "c", multiple: true },  // Filter by collection(s)
       // Collection options
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
       // Embed options
       force: { type: "boolean", short: "f" },
+      "max-docs-per-batch": { type: "string" },
+      "max-batch-mb": { type: "string" },
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
@@ -2328,6 +2520,12 @@ function parseCLI() {
       from: { type: "string" },  // start line
       "max-bytes": { type: "string" },  // max bytes for multi-get
       "line-numbers": { type: "boolean" },  // add line numbers to output
+      // Query options
+      "candidate-limit": { type: "string", short: "C" },
+      "no-rerank": { type: "boolean", default: false },
+      intent: { type: "string" },
+      // Chunking options
+      "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
       // MCP HTTP transport options
       http: { type: "boolean" },
       daemon: { type: "boolean" },
@@ -2365,6 +2563,11 @@ function parseCLI() {
     all: isAll,
     collection: values.collection as string[] | undefined,
     lineNumbers: !!values["line-numbers"],
+    candidateLimit: values["candidate-limit"] ? parseInt(String(values["candidate-limit"]), 10) : undefined,
+    skipRerank: !!values["no-rerank"],
+    explain: !!values.explain,
+    intent: values.intent as string | undefined,
+    chunkStrategy: parseChunkStrategy(values["chunk-strategy"]),
   };
 
   return {
@@ -2376,22 +2579,130 @@ function parseCLI() {
   };
 }
 
+function getSkillInstallDir(globalInstall: boolean): string {
+  return globalInstall
+    ? resolve(homedir(), ".agents", "skills", "qmd")
+    : resolve(getPwd(), ".agents", "skills", "qmd");
+}
+
+function getClaudeSkillLinkPath(globalInstall: boolean): string {
+  return globalInstall
+    ? resolve(homedir(), ".claude", "skills", "qmd")
+    : resolve(getPwd(), ".claude", "skills", "qmd");
+}
+
+function pathExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function removePath(path: string): void {
+  const stat = lstatSync(path);
+  if (stat.isDirectory() && !stat.isSymbolicLink()) {
+    rmSync(path, { recursive: true, force: true });
+  } else {
+    unlinkSync(path);
+  }
+}
+
 function showSkill(): void {
-  const scriptDir = dirname(fileURLToPath(import.meta.url));
-  const relativePath = pathJoin("skills", "qmd", "SKILL.md");
-  const skillPath = pathJoin(scriptDir, "..", relativePath);
-
-  console.log(`QMD Skill (${relativePath})`);
-  console.log(`Location: ${skillPath}`);
+  console.log("QMD Skill (embedded)");
   console.log("");
+  const content = getEmbeddedQmdSkillContent();
+  process.stdout.write(content.endsWith("\n") ? content : content + "\n");
+}
 
-  if (!existsSync(skillPath)) {
-    console.error("SKILL.md not found. If you built from source, ensure skills/qmd/SKILL.md exists.");
+function writeEmbeddedSkill(targetDir: string, force: boolean): void {
+  if (pathExists(targetDir)) {
+    if (!force) {
+      throw new Error(`Skill already exists: ${targetDir} (use --force to replace it)`);
+    }
+    removePath(targetDir);
+  }
+
+  mkdirSync(targetDir, { recursive: true });
+  for (const file of getEmbeddedQmdSkillFiles()) {
+    const destination = resolve(targetDir, file.relativePath);
+    mkdirSync(dirname(destination), { recursive: true });
+    writeFileSync(destination, file.content, "utf-8");
+  }
+}
+
+function ensureClaudeSymlink(linkPath: string, targetDir: string, force: boolean): boolean {
+  const parentDir = dirname(linkPath);
+  if (pathExists(parentDir)) {
+    const resolvedTargetDir = realpathSync(dirname(targetDir));
+    const resolvedLinkParent = realpathSync(parentDir);
+
+    // If .claude/skills already resolves to the same directory as .agents/skills,
+    // the skill is already visible to Claude and creating qmd -> qmd would loop.
+    if (resolvedTargetDir === resolvedLinkParent) {
+      return false;
+    }
+  }
+
+  const linkTarget = relativePath(parentDir, targetDir) || ".";
+
+  mkdirSync(parentDir, { recursive: true });
+
+  if (pathExists(linkPath)) {
+    const stat = lstatSync(linkPath);
+    if (stat.isSymbolicLink() && readlinkSync(linkPath) === linkTarget) {
+      return true;
+    }
+    if (!force) {
+      throw new Error(`Claude skill path already exists: ${linkPath} (use --force to replace it)`);
+    }
+    removePath(linkPath);
+  }
+
+  symlinkSync(linkTarget, linkPath, "dir");
+  return true;
+}
+
+async function shouldCreateClaudeSymlink(linkPath: string, autoYes: boolean): Promise<boolean> {
+  if (autoYes) {
+    return true;
+  }
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.log(`Tip: create a Claude symlink manually at ${linkPath}`);
+    return false;
+  }
+
+  const rl = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  try {
+    const answer = await rl.question(`Create a symlink in ${linkPath}? [y/N] `);
+    const normalized = answer.trim().toLowerCase();
+    return normalized === "y" || normalized === "yes";
+  } finally {
+    rl.close();
+  }
+}
+
+async function installSkill(globalInstall: boolean, force: boolean, autoYes: boolean): Promise<void> {
+  const installDir = getSkillInstallDir(globalInstall);
+  writeEmbeddedSkill(installDir, force);
+  console.log(`✓ Installed QMD skill to ${installDir}`);
+
+  const claudeLinkPath = getClaudeSkillLinkPath(globalInstall);
+  if (!(await shouldCreateClaudeSymlink(claudeLinkPath, autoYes))) {
     return;
   }
 
-  const content = readFileSync(skillPath, "utf-8");
-  process.stdout.write(content.endsWith("\n") ? content : content + "\n");
+  const linked = ensureClaudeSymlink(claudeLinkPath, installDir, force);
+  if (linked) {
+    console.log(`✓ Linked Claude skill at ${claudeLinkPath}`);
+  } else {
+    console.log(`✓ Claude already sees the skill via ${dirname(claudeLinkPath)}`);
+  }
 }
 
 function showHelp(): void {
@@ -2407,7 +2718,9 @@ function showHelp(): void {
   console.log("  qmd vsearch <query>           - Vector similarity only");
   console.log("  qmd get <file>[:line] [-l N]  - Show a single document, optional line slice");
   console.log("  qmd multi-get <pattern>       - Batch fetch via glob or comma-separated list");
+  console.log("  qmd skill show/install        - Show or install the packaged QMD skill");
   console.log("  qmd mcp                       - Start the MCP server (stdio transport for AI agents)");
+  console.log("  qmd bench <fixture.json>      - Run search quality benchmarks against a fixture file");
   console.log("");
   console.log("Collections & context:");
   console.log("  qmd collection add/list/remove/rename/show   - Manage indexed folders");
@@ -2417,7 +2730,9 @@ function showHelp(): void {
   console.log("Maintenance:");
   console.log("  qmd status                    - View index + collection health");
   console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
-  console.log("  qmd embed [-f]                - Generate/refresh vector embeddings");
+  console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
+  console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
+  console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
   console.log("");
   console.log("Query syntax (qmd query):");
@@ -2429,7 +2744,8 @@ function showHelp(): void {
     `query          = expand_query | query_document ;`,
     `expand_query   = text | explicit_expand ;`,
     `explicit_expand= "expand:" text ;`,
-    `query_document = { typed_line } ;`,
+    `query_document = [ intent_line ] { typed_line } ;`,
+    `intent_line    = "intent:" text newline ;`,
     `typed_line     = type ":" text newline ;`,
     `type           = "lex" | "vec" | "hyde" ;`,
     `text           = quoted_phrase | plain_text ;`,
@@ -2455,20 +2771,29 @@ function showHelp(): void {
   console.log("");
   console.log("AI agents & integrations:");
   console.log("  - Run `qmd mcp` to expose the MCP server (stdio) to agents/IDEs.");
-  console.log("  - `qmd --skill` prints the packaged skills/qmd/SKILL.md (path + contents).");
+  console.log("  - `qmd skill install` installs the QMD skill into ./.agents/skills/qmd.");
+  console.log("  - Use `qmd skill install --global` for ~/.agents/skills/qmd.");
+  console.log("  - `qmd --skill` is kept as an alias for `qmd skill show`.");
   console.log("  - Advanced: `qmd mcp --http ...` and `qmd mcp --http --daemon` are optional for custom transports.");
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use a named index (default: index)");
+  console.log("  QMD_EDITOR_URI             - Editor link template for clickable TTY search output");
   console.log("");
   console.log("Search options:");
   console.log("  -n <num>                   - Max results (default 5, or 20 for --files/--json)");
   console.log("  --all                      - Return all matches (pair with --min-score)");
   console.log("  --min-score <num>          - Minimum similarity score");
   console.log("  --full                     - Output full document instead of snippet");
+  console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
+  console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
   console.log("  --line-numbers             - Include line numbers in output");
+  console.log("  --explain                  - Include retrieval score traces (query --json/CLI)");
   console.log("  --files | --json | --csv | --md | --xml  - Output format");
   console.log("  -c, --collection <name>    - Filter by one or more collections");
+  console.log("");
+  console.log("Embed/query options:");
+  console.log("  --chunk-strategy <auto|regex> - Chunking mode (default: regex; auto uses AST for code files)");
   console.log("");
   console.log("Multi-get options:");
   console.log("  -l <num>                   - Maximum lines per file");
@@ -2480,7 +2805,7 @@ function showHelp(): void {
 
 async function showVersion(): Promise<void> {
   const scriptDir = dirname(fileURLToPath(import.meta.url));
-  const pkgPath = resolve(scriptDir, "..", "package.json");
+  const pkgPath = resolve(scriptDir, "..", "..", "package.json");
   const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
 
   let commit = "";
@@ -2502,6 +2827,11 @@ const isMain = argv1 === __filename
   || argv1?.endsWith("/qmd.js")
   || (argv1 != null && realpathSync(argv1) === __filename);
 if (isMain) {
+  // Flip to production mode only when this module is executed as the CLI
+  // entrypoint, not when imported for its exports. Tests must set INDEX_PATH
+  // or use createStore() with an explicit path.
+  enableProductionMode();
+
   const cli = parseCLI();
 
   if (cli.values.version) {
@@ -2511,6 +2841,20 @@ if (isMain) {
 
   if (cli.values.skill) {
     showSkill();
+    process.exit(0);
+  }
+
+  if (cli.values.help && cli.command === "skill") {
+    console.log("Usage: qmd skill <show|install> [options]");
+    console.log("");
+    console.log("Commands:");
+    console.log("  show                 Print the packaged QMD skill");
+    console.log("  install              Install into ./.agents/skills/qmd");
+    console.log("");
+    console.log("Options:");
+    console.log("  --global             Install into ~/.agents/skills/qmd");
+    console.log("  --yes                Also create the .claude/skills/qmd symlink");
+    console.log("  -f, --force          Replace existing install or symlink");
     process.exit(0);
   }
 
@@ -2675,7 +3019,7 @@ if (isMain) {
             console.error("  Omit command to clear it");
             process.exit(1);
           }
-          const { updateCollectionSettings, getCollection } = await import("./collections.js");
+          const { updateCollectionSettings, getCollection } = await import("../collections.js");
           const col = getCollection(name);
           if (!col) {
             console.error(`Collection not found: ${name}`);
@@ -2698,7 +3042,7 @@ if (isMain) {
             console.error(`  ${subcommand === 'include' ? 'Include' : 'Exclude'} collection in default queries`);
             process.exit(1);
           }
-          const { updateCollectionSettings, getCollection } = await import("./collections.js");
+          const { updateCollectionSettings, getCollection } = await import("../collections.js");
           const col = getCollection(name);
           if (!col) {
             console.error(`Collection not found: ${name}`);
@@ -2717,7 +3061,7 @@ if (isMain) {
             console.error("Usage: qmd collection show <name>");
             process.exit(1);
           }
-          const { getCollection } = await import("./collections.js");
+          const { getCollection } = await import("../collections.js");
           const col = getCollection(name);
           if (!col) {
             console.error(`Collection not found: ${name}`);
@@ -2775,7 +3119,26 @@ if (isMain) {
       break;
 
     case "embed":
-      await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force);
+      try {
+        const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
+        const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
+        const embedChunkStrategy = parseChunkStrategy(cli.values["chunk-strategy"]);
+        // Validate -c against configured collections before dispatching, so a
+        // typo errors with "Collection not found: X" instead of silently
+        // reporting success because no pending docs match a nonexistent name.
+        // embed operates on a single collection; only the first value is used.
+        const embedValidatedCollections = resolveCollectionFilter(cli.opts.collection, false);
+        const embedCollection = embedValidatedCollections[0];
+        await vectorIndex(resolveEmbedModelForCli(), !!cli.values.force, {
+          maxDocsPerBatch,
+          maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
+          chunkStrategy: embedChunkStrategy,
+          collection: embedCollection,
+        });
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exit(1);
+      }
       break;
 
     case "pull": {
@@ -2828,6 +3191,24 @@ if (isMain) {
       await querySearch(cli.query, cli.opts);
       break;
 
+    case "bench": {
+      const fixturePath = cli.args[0];
+      if (!fixturePath) {
+        console.error("Usage: qmd bench <fixture.json> [--json] [-c collection]");
+        console.error("");
+        console.error("Run search quality benchmarks against a fixture file.");
+        console.error("See src/bench/fixtures/example.json for the fixture format.");
+        process.exit(1);
+      }
+      const { runBenchmark } = await import("../bench/bench.js");
+      const benchCollection = cli.opts.collection;
+      await runBenchmark(fixturePath, {
+        json: !!(cli.opts as { json?: boolean }).json,
+        collection: Array.isArray(benchCollection) ? benchCollection[0] : benchCollection,
+      });
+      break;
+    }
+
     case "mcp": {
       const sub = cli.args[0]; // stop | status | undefined
 
@@ -2876,9 +3257,10 @@ if (isMain) {
           const logPath = resolve(cacheDir, "mcp.log");
           const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
           const selfPath = fileURLToPath(import.meta.url);
+          const indexArgs = cli.values.index ? ["--index", String(cli.values.index)] : [];
           const spawnArgs = selfPath.endsWith(".ts")
-            ? ["--import", pathJoin(dirname(selfPath), "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, "mcp", "--http", "--port", String(port)]
-            : [selfPath, "mcp", "--http", "--port", String(port)];
+            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...indexArgs, "mcp", "--http", "--port", String(port)]
+            : [selfPath, ...indexArgs, "mcp", "--http", "--port", String(port)];
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
             detached: true,
@@ -2896,9 +3278,9 @@ if (isMain) {
         // async cleanup handlers in startMcpHttpServer actually run.
         process.removeAllListeners("SIGTERM");
         process.removeAllListeners("SIGINT");
-        const { startMcpHttpServer } = await import("./mcp.js");
+        const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
-          await startMcpHttpServer(port);
+          await startMcpHttpServer(port, { dbPath: getDbPath() });
         } catch (e: any) {
           if (e?.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);
@@ -2908,8 +3290,49 @@ if (isMain) {
         }
       } else {
         // Default: stdio transport
-        const { startMcpServer } = await import("./mcp.js");
-        await startMcpServer();
+        const { startMcpServer } = await import("../mcp/server.js");
+        await startMcpServer({ dbPath: getDbPath() });
+      }
+      break;
+    }
+
+    case "skill": {
+      const subcommand = cli.args[0];
+      switch (subcommand) {
+        case "show": {
+          showSkill();
+          break;
+        }
+
+        case "install": {
+          try {
+            await installSkill(Boolean(cli.values.global), Boolean(cli.values.force), Boolean(cli.values.yes));
+          } catch (error) {
+            console.error(error instanceof Error ? error.message : String(error));
+            process.exit(1);
+          }
+          break;
+        }
+
+        case "help":
+        case undefined: {
+          console.log("Usage: qmd skill <show|install> [options]");
+          console.log("");
+          console.log("Commands:");
+          console.log("  show                 Print the packaged QMD skill");
+          console.log("  install              Install into ./.agents/skills/qmd");
+          console.log("");
+          console.log("Options:");
+          console.log("  --global             Install into ~/.agents/skills/qmd");
+          console.log("  --yes                Also create the .claude/skills/qmd symlink");
+          console.log("  -f, --force          Replace existing install or symlink");
+          process.exit(0);
+        }
+
+        default:
+          console.error(`Unknown subcommand: ${subcommand}`);
+          console.error("Run 'qmd skill help' for usage");
+          process.exit(1);
       }
       break;
     }

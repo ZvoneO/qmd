@@ -2,6 +2,280 @@
 
 ## [Unreleased]
 
+### Fixes
+
+- Embedding: `qmd embed -c <collection>` now scopes pending-doc selection
+  to the requested collection instead of embedding global pending work.
+  Scoped `--force` clears only collection-owned vectors, preserves shared
+  hashes referenced by sibling collections, and drops `vectors_vec` only
+  when the scoped clear empties all vectors.
+- Hybrid search: weight RRF lists by query type so original FTS and original vector evidence get the intended 2x boost, instead of accidentally boosting the first lexical expansion. #591
+- MCP: seed llama.cpp/GGML quiet env vars before launching `qmd mcp` so native logs cannot pollute stdio JSON-RPC framing. #593
+- CLI: remove CommonJS `require()` calls from ESM index path normalization so `qmd --index <path>` no longer crashes with `ERR_AMBIGUOUS_MODULE_SYNTAX` on Node 22+. #634
+- Windows CUDA: serialize llama.cpp embedding/reranking contexts by default to avoid intermittent `ggml-cuda.cu:98` crashes in `qmd query`; set `QMD_EMBED_PARALLELISM` to opt back into parallel contexts if your driver is stable. #519
+- MCP: make `qmd mcp --index <name>` use the selected index for both foreground and daemon HTTP servers instead of falling back to the default store. #343
+- Embedding: respect `QMD_EMBED_MODEL` consistently for vector indexing and vector-backed search, with default-model fallback when unset.
+- Config: use one home-directory resolver for YAML config and the default SQLite cache path, avoiding Windows CLI/MCP split-brain when `HOME` is unset.
+- GPU: respect explicit `QMD_LLAMA_GPU=metal|vulkan|cuda` backend overrides instead of always using auto GPU selection. #529
+- Fix: preserve original filename case in `handelize()`. The previous
+  `.toLowerCase()` call made indexed paths unreachable on case-sensitive
+  filesystems (Linux). `qmd update` automatically migrates legacy
+  lowercase paths without re-embedding.
+- CLI: make `qmd status` skip native `node-llama-cpp` device probing by
+  default so status stays safe on machines with broken or unsupported GPU
+  drivers. Set `QMD_STATUS_DEVICE_PROBE=1` to opt in.
+- CLI: lazy-load `node-llama-cpp` so lightweight commands such as
+  `qmd status` do not import native ML dependencies or trigger llama.cpp
+  builds on ARM/no-GPU machines. #491
+- Store: keep content rows referenced by inactive documents during orphan
+  cleanup so `qmd update` preserves soft-deleted tombstones for removed
+  files. #585
+- Packaging: install AST grammar WASM packages as required dependencies so
+  Bun global installs include TypeScript/TSX/JavaScript grammars, and add a
+  `smoke:package-grammars` verification command. #595
+
+## [2.1.0] - 2026-04-05
+
+Code files now chunk at function and class boundaries via tree-sitter,
+clickable editor links land you at the right line from search results,
+and per-collection model configuration means you can point different
+collections at different embedding models. 25+ community PRs fix
+embedding stability, BM25 accuracy, and cross-platform launcher issues.
+
+### Changes
+
+- AST-aware chunking for code files via `web-tree-sitter`. Supported
+  languages: TypeScript/JavaScript, Python, Go, and Rust. Code files
+  are chunked at function, class, and import boundaries instead of
+  arbitrary text positions. Markdown and unknown file types are unchanged.
+  `--chunk-strategy <auto|regex>` flag on `qmd embed` and `qmd query`
+  (default `regex`). SDK: `chunkStrategy` option on `embed()` and
+  `search()`. `qmd status` shows grammar availability.
+- `qmd bench <fixture.json>` command for search quality benchmarks.
+  Measures precision@k, recall, MRR, and F1 across BM25, vector, hybrid,
+  and full pipeline backends. Ships with an example fixture against
+  the eval-docs test collection. #470 (thanks @jmilinovich)
+- `models:` section in `index.yml` lets you configure `embed`, `rerank`,
+  and `generate` model URIs per collection. Resolution order is
+  config > env var (`QMD_EMBED_MODEL`, `QMD_RERANK_MODEL`,
+  `QMD_GENERATE_MODEL`) > built-in default. #502
+  (thanks @JohnRichardEnders)
+- CLI search output now emits clickable OSC 8 terminal hyperlinks when
+  stdout is a TTY. Links resolve `qmd://` paths to absolute filesystem
+  paths and open in editors via URI templates (default:
+  `vscode://file/{path}:{line}:{col}`). Configure with `QMD_EDITOR_URI`
+  or `editor_uri` in the YAML config. #508 (thanks @danmackinlay)
+- `--no-rerank` flag skips the reranking step in `qmd query` — useful
+  when you want fast results or don't have a GPU. Also exposed as
+  `rerank: false` on the MCP `query` tool. #370 (thanks @mvanhorn),
+  #478 (thanks @zestyboy)
+- ONNX conversion script for deploying embedding models via
+  Transformers.js. #399 (thanks @shreyaskarnik)
+- GitHub Actions workflow to build the Nix flake on Linux and macOS.
+
+### Fixes
+
+- Embedding: prevent `qmd embed` from running indefinitely when the
+  embedding loop stalls. #458 (thanks @ccc-fff)
+- Embedding: truncate oversized text before embedding to prevent GGML
+  crash, and bound memory usage during batch embedding. #393
+  (thanks @lskun), #395 (thanks @ProgramCaiCai)
+- Embedding: set explicit embed context size (default 2048, configurable
+  via `QMD_EMBED_CONTEXT_SIZE`) instead of using the model's full
+  window. #500
+- Embedding: error on dimension mismatch instead of silently rebuilding
+  the vec0 table. #501
+- Embedding: handle vec0 `OR REPLACE` limitation in `insertEmbedding`.
+  #456 (thanks @antonio-mello-ai)
+- Embedding: fix model selection when multiple models are configured.
+  #494
+- BM25: correct field weights to include all 3 FTS columns — title,
+  body, and path were not weighted correctly. #462 (thanks @goldsr09)
+- BM25: handle hyphenated tokens in FTS5 lex queries so terms like
+  "real-time" match correctly. #463 (thanks @goldsr09)
+- BM25: preserve underscores in search terms instead of stripping them.
+  #404
+- BM25: use CTE in `searchFTS` to prevent query planner regression with
+  collection filter.
+- Reranker: increase default context size 2048→4096 and make
+  configurable via `QMD_RERANK_CONTEXT_SIZE`. Fix template overhead
+  underestimate 200→512. #453 (thanks @builderjarvis)
+- GPU: catch initialization failures and fall back to CPU instead of
+  crashing.
+- MCP: read version from `package.json` instead of hardcoding. #431
+- MCP: include collection name in status output. #416
+- Multi-get: support brace expansion patterns in glob matching. #424
+- Launcher: prioritize `package-lock.json` to prevent Bun false
+  positive. #385 (thanks @rymalia)
+- Launcher: remove `$BUN_INSTALL` check that caused false Bun detection.
+  #362 (thanks @syedair)
+- Launcher: skip Git Bash path detection on WSL. #371
+  (thanks @oysteinkrog)
+- Model cache: respect `XDG_CACHE_HOME` for model cache directory. #457
+  (thanks @antonio-mello-ai)
+- SQLite: add macOS Homebrew SQLite support for Bun and restore
+  actionable errors. #377 (thanks @serhii12)
+- Pin zod to exact 4.2.1 to fix `tsc` build failure. #382
+  (thanks @rymalia)
+- Preserve dots and original case in `handelize()` — filenames like
+  `MEMORY.md` no longer become `memory-md`. #475 (thanks @alexei-led)
+- Include `line` in `--json` search output so editor integrations can
+  jump directly to `file:line`. #506 (thanks @danmackinlay)
+- Nix: fix paths in flake and make Bun dependency a fixed-output
+  derivation so sandboxed Linux builds work offline. #479
+  (thanks @surma-dump)
+- Sync stale `bun.lock` (`better-sqlite3` 11.x → 12.x). CI and release
+  script now use `--frozen-lockfile` to prevent recurrence. #386
+  (thanks @Mic92)
+- Approve native build scripts in pnpm so `better-sqlite3` and
+  tree-sitter modules compile correctly. Update vitest ^3.0.0 → ^3.2.4.
+
+## [2.0.1] - 2026-03-10
+
+### Changes
+
+- `qmd skill install` copies the packaged QMD skill into
+  `~/.claude/commands/` for one-command setup. #355 (thanks @nibzard)
+
+### Fixes
+
+- Fix Qwen3-Embedding GGUF filename case — HuggingFace filenames are
+  case-sensitive, the lowercase variant returned 404. #349 (thanks @byheaven)
+- Resolve symlinked global launcher path so `qmd` works correctly when
+  installed via `npm i -g`. #352 (thanks @nibzard)
+
+## [2.0.0] - 2026-03-10
+
+QMD 2.0 declares a stable library API. The SDK is now the primary interface —
+the MCP server is a clean consumer of it, and the source is organized into
+`src/cli/` and `src/mcp/`. Also: Node 25 support and a runtime-aware bin wrapper
+for bun installs.
+
+### Changes
+
+- Stable SDK API with `QMDStore` interface — search, retrieval, collection/context
+  management, indexing, lifecycle
+- Unified `search()`: pass `query` for auto-expansion or `queries` for
+  pre-expanded lex/vec/hyde — replaces the old query/search/structuredSearch split
+- New `getDocumentBody()`, `getDefaultCollectionNames()`, `Maintenance` class
+- MCP server rewritten as a clean SDK consumer — zero internal store access
+- CLI and MCP organized into `src/cli/` and `src/mcp/` subdirectories
+- Runtime-aware `bin/qmd` wrapper detects bun vs node to avoid ABI mismatches.
+  Closes #319
+- `better-sqlite3` bumped to ^12.4.5 for Node 25 support. Closes #257
+- Utility exports: `extractSnippet`, `addLineNumbers`, `DEFAULT_MULTI_GET_MAX_BYTES`
+
+### Fixes
+
+- Remove unused `import { resolve }` in store.ts that shadowed local export
+
+## [1.1.6] - 2026-03-09
+
+QMD can now be used as a library. `import { createStore } from '@tobilu/qmd'`
+gives you the full search and indexing API — hybrid query, BM25, structured
+search, collection/context management — without shelling out to the CLI.
+
+### Changes
+
+- **SDK / library mode**: `createStore({ dbPath, config })` returns a
+  `QMDStore` with `query()`, `search()`, `structuredSearch()`, `get()`,
+  `multiGet()`, and collection/context management methods. Supports inline
+  config (no files needed) or a YAML config path.
+- **Package exports**: `package.json` now declares `main`, `types`, and
+  `exports` so bundlers and TypeScript resolve `@tobilu/qmd` correctly.
+
+## [1.1.5] - 2026-03-07
+
+Ambiguous queries like "performance" now produce dramatically better results
+when the caller knows what they mean. The new `intent` parameter steers all
+five pipeline stages — expansion, strong-signal bypass, chunk selection,
+reranking, and snippet extraction — without searching on its own. Design and
+original implementation by Ilya Grigorik (@vyalamar) in #180.
+
+### Changes
+
+- **Intent parameter**: optional `intent` string disambiguates queries across
+  the entire search pipeline. Available via CLI (`--intent` flag or `intent:`
+  line in query documents), MCP (`intent` field on the query tool), and
+  programmatic API. Adapted from PR #180 (thanks @vyalamar).
+- **Query expansion**: when intent is provided, the expansion LLM prompt
+  includes `Query intent: {intent}`, matching the finetune training data
+  format for better-aligned expansions.
+- **Reranking**: intent is prepended to the rerank query so Qwen3-Reranker
+  scores with domain context.
+- **Chunk selection**: intent terms scored at 0.5× weight alongside query
+  terms (1.0×) when selecting the best chunk per document for reranking.
+- **Snippet extraction**: intent terms scored at 0.3× weight to nudge
+  snippets toward intent-relevant lines without overriding query anchoring.
+- **Strong-signal bypass disabled with intent**: when intent is provided, the
+  BM25 strong-signal shortcut is skipped — the obvious keyword match may not
+  be what the caller wants.
+- **MCP instructions**: callers are now guided to provide `intent` on every
+  search call for disambiguation.
+- **Query document syntax**: `intent:` recognized as a line type. At most one
+  per document, cannot appear alone. Grammar updated in `docs/SYNTAX.md`.
+
+## [1.1.2] - 2026-03-07
+
+13 community PRs merged. GPU initialization replaced with node-llama-cpp's
+built-in `autoAttempt` — deleting ~220 lines of manual fallback code and
+fixing GPU issues reported across 10+ PRs in one shot. Reranking is faster
+through chunk deduplication and a parallelism cap that prevents VRAM
+exhaustion.
+
+### Changes
+
+- **GPU init**: use node-llama-cpp's `build: "autoAttempt"` instead of manual
+  GPU backend detection. Automatically tries Metal/CUDA/Vulkan and falls back
+  gracefully. #310 (thanks @giladgd — the node-llama-cpp author)
+- **Query `--explain`**: `qmd query --explain` exposes retrieval score traces
+  — backend scores, per-list RRF contributions, top-rank bonus, reranker
+  score, and final blended score. Works in JSON and CLI output. #242
+  (thanks @vyalamar)
+- **Collection ignore patterns**: `ignore: ["Sessions/**", "*.tmp"]` in
+  collection config to exclude files from indexing. #304 (thanks @sebkouba)
+- **Multilingual embeddings**: `QMD_EMBED_MODEL` env var lets you swap in
+  models like Qwen3-Embedding for non-English collections. #273 (thanks
+  @daocoding)
+- **Configurable expansion context**: `QMD_EXPAND_CONTEXT_SIZE` env var
+  (default 2048) — previously used the model's full 40960-token window,
+  wasting VRAM. #313 (thanks @0xble)
+- **`candidateLimit` exposed**: `-C` / `--candidate-limit` flag and MCP
+  parameter to tune how many candidates reach the reranker. #255 (thanks
+  @pandysp)
+- **MCP multi-session**: HTTP transport now supports multiple concurrent
+  client sessions, each with its own server instance. #286 (thanks @joelev)
+
+### Fixes
+
+- **Reranking performance**: cap parallel rerank contexts at 4 to prevent
+  VRAM exhaustion on high-core machines. Deduplicate identical chunk texts
+  before reranking — same content from different files now shares a single
+  reranker call. Cache scores by content hash instead of file path.
+- Deactivate stale docs when all files are removed from a collection and
+  `qmd update` is run. #312 (thanks @0xble)
+- Handle emoji-only filenames (`🐘.md` → `1f418.md`) instead of crashing.
+  #308 (thanks @debugerman)
+- Skip unreadable files during indexing (e.g. iCloud-evicted files returning
+  EAGAIN) instead of crashing. #253 (thanks @jimmynail)
+- Suppress progress bar escape sequences when stderr is not a TTY. #230
+  (thanks @dgilperez)
+- Emit format-appropriate empty output (`[]` for JSON, CSV header for CSV,
+  etc.) instead of plain text "No results." #228 (thanks @amsminn)
+- Correct Windows sqlite-vec package name (`sqlite-vec-windows-x64`) and add
+  `sqlite-vec-linux-arm64`. #225 (thanks @ilepn)
+- Fix claude plugin setup CLI commands in README. #311 (thanks @gi11es)
+
+## [1.1.1] - 2026-03-06
+
+### Fixes
+
+- Reranker: truncate documents exceeding the 2048-token context window
+  instead of silently producing garbage scores. Long chunks (e.g. from
+  PDF ingestion) now get a fair ranking.
+- Nix: add python3 and cctools to build dependencies. #214 (thanks
+  @pcasaretto)
+
 ## [1.1.0] - 2026-02-20
 
 QMD now speaks in **query documents** — structured multi-line queries where every line is typed (`lex:`, `vec:`, `hyde:`), combining keyword precision with semantic recall. A single plain query still works exactly as before (it's treated as an implicit `expand:` and auto-expanded by the LLM). Lex now supports quoted phrases and negation (`"C++ performance" -sports -athlete`), making intent-aware disambiguation practical. The formal query grammar is documented in `docs/SYNTAX.md`.
