@@ -23,6 +23,12 @@ import {
 } from "./store.js";
 import { BackendLifecycle, loadBackendConfig } from "./embed-lifecycle.js";
 
+function urlsFromBackendsConfig(): string[] | null {
+  const cfg = loadBackendConfig();
+  if (!cfg) return null;
+  return cfg.backends.map((b) => b.url);
+}
+
 export type HttpEmbedConfig = {
   /** Backend server URLs (default: localhost:11434, override via QMD_EMBED_URLS or QMD_OLLAMA_URLS env) */
   urls?: string[];
@@ -70,10 +76,11 @@ export class HttpEmbedPool {
 
   constructor(config: HttpEmbedConfig = {}) {
     const envUrls = process.env.QMD_EMBED_URLS || process.env.QMD_OLLAMA_URLS;
+    const cfgUrls = !envUrls ? urlsFromBackendsConfig() : null;
     this.urls = config.urls
       ?? (envUrls
         ? envUrls.split(",").map((u) => u.trim())
-        : DEFAULT_URLS);
+        : (cfgUrls && cfgUrls.length > 0 ? cfgUrls : DEFAULT_URLS));
     this.model = config.model ?? (process.env.QMD_OLLAMA_MODEL || DEFAULT_MODEL);
     this.timeoutMs = config.timeoutMs ?? 120_000;
   }

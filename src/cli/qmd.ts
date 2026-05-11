@@ -80,6 +80,7 @@ import {
 } from "../store.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
 import { generateEmbeddingsViaPool, printPoolStats } from "../embed-http-pool.js";
+import { loadBackendConfig } from "../embed-lifecycle.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -1715,9 +1716,12 @@ async function vectorIndex(
 
   const startTime = Date.now();
 
-  const useEmbedPool = !!process.env.QMD_EMBED_URLS || !!process.env.QMD_OLLAMA_URLS;
+  const envPoolUrls = process.env.QMD_EMBED_URLS || process.env.QMD_OLLAMA_URLS;
+  const cfgPool = !envPoolUrls ? loadBackendConfig() : null;
+  const cfgUrls = cfgPool ? cfgPool.backends.map((b) => b.url).join(",") : "";
+  const useEmbedPool = !!envPoolUrls || !!cfgUrls;
   if (useEmbedPool) {
-    console.log(`${c.dim}Backend: HttpEmbedPool (${process.env.QMD_EMBED_URLS || process.env.QMD_OLLAMA_URLS})${c.reset}`);
+    console.log(`${c.dim}Backend: HttpEmbedPool (${envPoolUrls || cfgUrls})${c.reset}`);
   }
   const embedFn = useEmbedPool ? generateEmbeddingsViaPool : generateEmbeddings;
 
