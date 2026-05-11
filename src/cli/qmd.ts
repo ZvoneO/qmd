@@ -79,6 +79,7 @@ import {
   type ChunkStrategy,
 } from "../store.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { generateEmbeddingsViaPool, printPoolStats } from "../embed-http-pool.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -1714,7 +1715,13 @@ async function vectorIndex(
 
   const startTime = Date.now();
 
-  const result = await generateEmbeddings(storeInstance, {
+  const useEmbedPool = !!process.env.QMD_EMBED_URLS || !!process.env.QMD_OLLAMA_URLS;
+  if (useEmbedPool) {
+    console.log(`${c.dim}Backend: HttpEmbedPool (${process.env.QMD_EMBED_URLS || process.env.QMD_OLLAMA_URLS})${c.reset}`);
+  }
+  const embedFn = useEmbedPool ? generateEmbeddingsViaPool : generateEmbeddings;
+
+  const result = await embedFn(storeInstance, {
     force,
     model,
     collection: batchOptions?.collection,
@@ -1753,6 +1760,9 @@ async function vectorIndex(
     console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${result.chunksEmbedded}${c.reset} chunks from ${c.bold}${result.docsProcessed}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset}`);
     if (result.errors > 0) {
       console.log(`${c.yellow}⚠ ${result.errors} chunks failed${c.reset}`);
+    }
+    if (useEmbedPool) {
+      printPoolStats();
     }
   }
 
