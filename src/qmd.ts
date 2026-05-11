@@ -1617,31 +1617,18 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
 
     let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
     const startTime = Date.now();
-    let linesDrawn = 0;
 
-    await ollama.embedStream(allTexts, (startIdx, results) => {
-      const dbBatch: { hash: string; seq: number; pos: number; embedding: Float32Array; model: string; embeddedAt: string }[] = [];
-      for (let i = 0; i < results.length; i++) {
-        const chunkIdx = startIdx + i;
-        const chunk = allChunks[chunkIdx]!;
-        const embedding = results[i];
-        if (embedding) {
-          dbBatch.push({ hash: chunk.hash, seq: chunk.seq, pos: chunk.pos, embedding: new Float32Array(embedding.embedding), model, embeddedAt: now });
-          chunksEmbedded++;
-        } else {
-          errors++;
-        }
-        bytesProcessed += chunk.bytes;
-      }
-
-      insertEmbeddingBatch(db, dbBatch);
-
-      const percent = (bytesProcessed / totalBytes) * 100;
+    // Single-line live display, redrawn on a throttled timer (not per-callback).
+    // Multiple server callbacks race; per-callback drawing produced interleaved output
+    // and non-monotonic counts in the scrollback. Timer-driven rendering avoids both.
+    const isTTY = Boolean(process.stderr.isTTY);
+    const render = () => {
+      const percent = totalBytes > 0 ? (bytesProcessed / totalBytes) * 100 : 0;
       progress.set(percent);
       const elapsed = (Date.now() - startTime) / 1000;
-      const bytesPerSec = bytesProcessed / elapsed;
+      const bytesPerSec = elapsed > 0 ? bytesProcessed / elapsed : 0;
       const remainingBytes = totalBytes - bytesProcessed;
-      const etaSec = remainingBytes / bytesPerSec;
+      const etaSec = bytesPerSec > 0 ? remainingBytes / bytesPerSec : 0;
 
       const bar = renderProgressBar(percent);
       const percentStr = percent.toFixed(0).padStart(3);
@@ -1649,39 +1636,44 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
       const eta = elapsed > 2 ? formatETA(etaSec) : "...";
       const errStr = errors > 0 ? ` ${c.yellow}${errors} err${c.reset}` : "";
 
-      // Build live per-server stats line
-      const serverStats = ollama.getStats().filter((s) => s.textsProcessed > 0);
-      const totalTexts = serverStats.reduce((sum, s) => sum + s.textsProcessed, 0) || 1;
-      const serverLine = serverStats.map((s) => {
-        const name = s.url.replace("http://", "").replace(":11434", "");
-        const short = name.length > 6 ? name.slice(0, 6) : name;
-        const pct = ((s.textsProcessed / totalTexts) * 100).toFixed(0);
-        const tps = s.totalMs > 0 ? ((s.textsProcessed / s.totalMs) * 1000).toFixed(0) : "0";
-        const avg = s.requestCount > 0 ? (s.totalMs / s.requestCount).toFixed(0) : "0";
-        return `${c.bold}${short}${c.reset}${c.dim}:${tps} chunks/s ${pct}% ~${avg}ms${c.reset}`;
-      }).join("  ");
-
-      // 2-line live display: server stats + progress bar
-      if (linesDrawn > 0) {
-        process.stderr.write(`\x1b[${linesDrawn}A`);
+      const line = `${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${chunksEmbedded}/${totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}`;
+      if (isTTY) {
+        process.stderr.write(`\r\x1b[K${line}`);
       }
-      process.stderr.write(`\r\x1b[K${serverLine}\n`);
-      process.stderr.write(`\r\x1b[K${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${chunksEmbedded}/${totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}`);
-      linesDrawn = 2;
-    });
+    };
+
+    const renderTimer = isTTY ? setInterval(render, 250) : null;
+
+    try {
+      await ollama.embedStream(allTexts, (startIdx, results) => {
+        const dbBatch: { hash: string; seq: number; pos: number; embedding: Float32Array; model: string; embeddedAt: string }[] = [];
+        for (let i = 0; i < results.length; i++) {
+          const chunkIdx = startIdx + i;
+          const chunk = allChunks[chunkIdx]!;
+          const embedding = results[i];
+          if (embedding) {
+            dbBatch.push({ hash: chunk.hash, seq: chunk.seq, pos: chunk.pos, embedding: new Float32Array(embedding.embedding), model, embeddedAt: now });
+            chunksEmbedded++;
+          } else {
+            errors++;
+          }
+          bytesProcessed += chunk.bytes;
+        }
+        insertEmbeddingBatch(db, dbBatch);
+        // No drawing here — render() runs on its own timer.
+      });
+    } finally {
+      if (renderTimer) clearInterval(renderTimer);
+    }
 
     progress.clear();
     cursor.show();
     const totalTimeSec = (Date.now() - startTime) / 1000;
     const avgThroughput = formatBytes(totalBytes / totalTimeSec);
 
-    if (linesDrawn > 0) {
-      process.stderr.write(`\x1b[${linesDrawn}A`);
-      process.stderr.write(`\r\x1b[K\n\r\x1b[K`);
-      process.stderr.write(`\x1b[${linesDrawn}A`);
-    }
-    console.log(`${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
-    console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${chunksEmbedded}${c.reset} chunks from ${c.bold}${totalDocs}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset} ${c.dim}(${avgThroughput}/s)${c.reset}`);
+    if (isTTY) process.stderr.write(`\r\x1b[K`);
+    console.log(`${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}`);
+    console.log(`${c.green}✓ Done!${c.reset} Embedded ${c.bold}${chunksEmbedded}${c.reset} chunks from ${c.bold}${totalDocs}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset} ${c.dim}(${avgThroughput}/s)${c.reset}`);
     if (errors > 0) {
       console.log(`${c.yellow}⚠ ${errors} chunks failed${c.reset}`);
     }

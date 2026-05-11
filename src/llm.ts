@@ -1433,7 +1433,9 @@ export type OllamaEmbedConfig = {
 };
 
 const DEFAULT_OLLAMA_URLS = ["http://localhost:11434"];
-const DEFAULT_OLLAMA_MODEL = DEFAULT_EMBED_MODEL;
+// Ollama expects a model name like "embeddinggemma:300m", not the llama.cpp HF URI
+// used by node-llama-cpp. Override with QMD_OLLAMA_MODEL env var.
+const DEFAULT_OLLAMA_MODEL = "embeddinggemma:300m";
 
 export type ServerStats = {
   url: string;
