@@ -10,6 +10,21 @@
 
 ### Fixes
 
+- Query scoring: fix RRF rank-1 saturation. The positional prior
+  (`positionWeight × 1/rank`) applied unconditionally, so a single weak
+  candidate inherited the rank-1 floor (~0.75) and displayed ~88% even when the
+  reranker was uncertain (~0.50) — nonsense queries scored like real hits. The
+  positional weight is now scaled by evidence: reranker confidence OR cross-arm
+  corroboration (`trust = max(rerankGate, supportFactor)`), plus a small
+  isolation damp for a lone, uncorroborated, no-signal candidate. Genuine hits
+  and multi-arm rescues stay high (>90%); unsupported garbage drops to the
+  reranker's neutral point (~45–50%). Applied to both `query` and structured
+  search blending.
+- Query scoring: deterministic exact-match boost. When a query contains an
+  identifier-like token (snake_case, camelCase, or dotted path) that exactly
+  matches a result's title or path as a whole token, that result is floored to
+  near-certainty (0.99) so the reranker cannot suppress an obvious hit. Kept
+  conservative — ordinary words and lone Capitalized words never trigger it.
 - Keyword search: phrasing-robust FTS5 fallback. A natural-language question
   ("where does consultant availability live", "which files use X endpoint")
   used to AND every token — including interrogative/idiom words like

@@ -314,6 +314,153 @@ export const STRONG_SIGNAL_MIN_GAP = 0.15;
 // 40 keeps rank 31-40 visible to the reranker (matters for recall on broad queries).
 export const RERANK_CANDIDATE_LIMIT = 40;
 
+// --- Confidence blending (fixes RRF rank-1 saturation) -----------------------
+// The positional prior (positionWeight × 1/rank) used to apply unconditionally,
+// so a single weak candidate inherited a rank-1 floor (~0.75) and displayed
+// ~88% even when the reranker was uncertain (~0.50). We scale the positional
+// weight by how much the position can be TRUSTED, derived from evidence.
+export const RERANK_CONF_LO = 0.5;     // reranker "no signal" point (probability)
+export const RERANK_CONF_HI = 0.7;     // reranker "confident" point
+export const ISOLATION_DAMP = 0.9;     // haircut for a lone, uncorroborated, uncertain hit
+// Near-certain floor applied when a query identifier token exactly matches a
+// result's title/path (deterministic exact-match boost).
+export const EXACT_MATCH_SCORE = 0.99;
+
+function clamp01(x: number): number {
+  if (x < 0) return 0;
+  if (x > 1) return 1;
+  return x;
+}
+
+/** Position-aware base weight for the RRF prior (higher ranks get more protection). */
+export function positionWeightForRank(rrfRank: number): number {
+  if (rrfRank <= 3) return 0.75;
+  if (rrfRank <= 10) return 0.60;
+  return 0.40;
+}
+
+export interface BlendInput {
+  /** Reranker probability in [0,1]. */
+  rerankScore: number;
+  /** 1-based rank after RRF fusion. */
+  rrfRank: number;
+  /** Number of distinct retrieval lists (arms) that surfaced this file. */
+  armCount: number;
+  /** Total number of fused candidates for this query. */
+  poolSize: number;
+}
+
+export interface BlendResult {
+  blendedScore: number;
+  positionScore: number;
+  /** Effective positional weight actually applied after evidence scaling. */
+  positionWeight: number;
+}
+
+/**
+ * Blend the RRF positional prior with the reranker score, scaling the
+ * positional weight by evidence so a lone weak candidate cannot inherit a
+ * high rank-1 floor.
+ *
+ *   trust = max(rerankGate, supportFactor)
+ *     rerankGate    — reranker confidence ramp: 0 at RERANK_CONF_LO ("no
+ *                     signal"), 1 at RERANK_CONF_HI. A confident reranker keeps
+ *                     full positional protection; an uncertain one removes it.
+ *     supportFactor — cross-arm corroboration: ≥2 arms ⇒ 1 (position fully
+ *                     trusted even if the reranker underscores it, preserving
+ *                     the rescue that motivated blending); 1 arm ⇒ 0.
+ *   positionWeight = basePositionWeight × trust
+ *   blended        = positionWeight × (1/rank) + (1 − positionWeight) × rerank
+ *
+ * Monotonic in rerankScore and in armCount. A lone, uncorroborated candidate
+ * the reranker cannot distinguish (≤ RERANK_CONF_LO) is damped below the
+ * neutral point so isolated weak matches read as low-confidence.
+ */
+export function blendConfidenceScore(input: BlendInput): BlendResult {
+  const { rerankScore, rrfRank, armCount, poolSize } = input;
+  const basePositionWeight = positionWeightForRank(rrfRank);
+  const positionScore = 1 / rrfRank;
+
+  const rerankGate = clamp01(
+    (rerankScore - RERANK_CONF_LO) / (RERANK_CONF_HI - RERANK_CONF_LO),
+  );
+  const supportFactor = clamp01(armCount - 1); // 0 for 1 arm, 1 for ≥2 arms
+  const trust = Math.max(rerankGate, supportFactor);
+  const positionWeight = basePositionWeight * trust;
+
+  let blendedScore = positionWeight * positionScore + (1 - positionWeight) * rerankScore;
+
+  // A lone candidate with no cross-arm corroboration that the reranker cannot
+  // distinguish (trust ≈ 0, i.e. reranker at its "no signal" floor) carries no
+  // comparative evidence — damp it below the neutral point so isolated weak
+  // matches read as clearly low-confidence rather than borderline.
+  if (armCount <= 1 && poolSize <= 2 && trust < 0.1) {
+    blendedScore *= ISOLATION_DAMP;
+  }
+
+  return { blendedScore, positionScore, positionWeight };
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Count, per file, how many distinct retrieval lists (arms) surfaced it.
+ * Used as the cross-arm corroboration signal in {@link blendConfidenceScore}.
+ */
+function computeArmCounts(rankedLists: { file: string }[][]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const list of rankedLists) {
+    const seen = new Set<string>();
+    for (const r of list) {
+      if (seen.has(r.file)) continue;
+      seen.add(r.file);
+      counts.set(r.file, (counts.get(r.file) ?? 0) + 1);
+    }
+  }
+  return counts;
+}
+
+/**
+ * Extract identifier-like tokens from a query for the deterministic
+ * exact-match boost. Conservative: only tokens that look like code
+ * identifiers — snake_case, dotted paths, or camelCase — never ordinary
+ * words. A single Capitalized word (e.g. "Consultant") is NOT an identifier.
+ */
+export function extractIdentifierTerms(query: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of query.split(/[\s,;:()[\]{}<>"'`]+/)) {
+    const t = raw.trim().replace(/^[.]+|[.]+$/g, ''); // strip leading/trailing dots
+    if (t.length < 3) continue;
+    if (!/^[A-Za-z0-9_.]+$/.test(t)) continue;   // identifier charset only
+    if (!/[A-Za-z]/.test(t)) continue;            // must contain a letter
+    const isSnake = t.includes('_');
+    const isDotted = /[A-Za-z0-9]\.[A-Za-z0-9]/.test(t);
+    const isCamel = /[a-z][A-Z]/.test(t);
+    if (isSnake || isDotted || isCamel) {
+      const key = t.toLowerCase();
+      if (!seen.has(key)) { seen.add(key); out.push(t); }
+    }
+  }
+  return out;
+}
+
+/**
+ * True when any identifier term matches a whole token in `text` (title or
+ * path), delimited by non-identifier characters so "ids" does not match
+ * "preferred_consultant_ids".
+ */
+export function textMatchesIdentifier(text: string | undefined, idents: string[]): boolean {
+  if (!text || idents.length === 0) return false;
+  for (const id of idents) {
+    const re = new RegExp(`(?<![A-Za-z0-9_])${escapeRegExp(id)}(?![A-Za-z0-9_])`, 'i');
+    if (re.test(text)) return true;
+  }
+  return false;
+}
+
 /**
  * A typed query expansion result. Decoupled from llm.ts internal Queryable —
  * same shape, but store.ts owns its own public API type.
@@ -4478,6 +4625,8 @@ export async function hybridQuery(
   const fused = reciprocalRankFusion(rankedLists, weights);
   const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
   const candidates = fused.slice(0, candidateLimit);
+  const armCountByFile = computeArmCounts(rankedLists);
+  const identTerms = extractIdentifierTerms(query);
 
   if (candidates.length === 0) return [];
 
@@ -4581,14 +4730,22 @@ export async function hybridQuery(
 
   const blended = reranked.map(r => {
     const rrfRank = rrfRankMap.get(r.file) || candidateLimit;
-    let rrfWeight: number;
-    if (rrfRank <= 3) rrfWeight = 0.75;
-    else if (rrfRank <= 10) rrfWeight = 0.60;
-    else rrfWeight = 0.40;
-    const rrfScore = 1 / rrfRank;
-    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
-
     const candidate = candidateMap.get(r.file);
+    const { blendedScore: rawBlend, positionScore: rrfScore, positionWeight } =
+      blendConfidenceScore({
+        rerankScore: r.score,
+        rrfRank,
+        armCount: armCountByFile.get(r.file) ?? 1,
+        poolSize: candidates.length,
+      });
+
+    // Deterministic exact-match boost: a query identifier token that exactly
+    // matches this result's title/path signals near-certainty — floor the score
+    // so the reranker cannot suppress an obvious hit.
+    const exactMatch = textMatchesIdentifier(candidate?.title, identTerms)
+      || textMatchesIdentifier(candidate?.displayPath, identTerms);
+    const blendedScore = exactMatch ? Math.max(rawBlend, EXACT_MATCH_SCORE) : rawBlend;
+
     const chunkInfo = docChunkMap.get(r.file);
     const bestIdx = chunkInfo?.bestIdx ?? 0;
     const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidate?.body || "";
@@ -4600,7 +4757,7 @@ export async function hybridQuery(
       rrf: {
         rank: rrfRank,
         positionScore: rrfScore,
-        weight: rrfWeight,
+        weight: positionWeight,
         baseScore: trace?.baseScore ?? 0,
         topRankBonus: trace?.topRankBonus ?? 0,
         totalScore: trace?.totalScore ?? 0,
@@ -4867,6 +5024,7 @@ export async function structuredSearch(
   const fused = reciprocalRankFusion(rankedLists, weights);
   const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
   const candidates = fused.slice(0, candidateLimit);
+  const armCountByFile = computeArmCounts(rankedLists);
 
   if (candidates.length === 0) return [];
 
@@ -4877,6 +5035,7 @@ export async function structuredSearch(
   const primaryQuery = searches.find(s => s.type === 'lex')?.query
     || searches.find(s => s.type === 'vec')?.query
     || searches[0]?.query || "";
+  const identTerms = extractIdentifierTerms(primaryQuery);
   const queryTerms = primaryQuery.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
@@ -4974,14 +5133,19 @@ export async function structuredSearch(
 
   const blended = reranked.map(r => {
     const rrfRank = rrfRankMap.get(r.file) || candidateLimit;
-    let rrfWeight: number;
-    if (rrfRank <= 3) rrfWeight = 0.75;
-    else if (rrfRank <= 10) rrfWeight = 0.60;
-    else rrfWeight = 0.40;
-    const rrfScore = 1 / rrfRank;
-    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
-
     const candidate = candidateMap.get(r.file);
+    const { blendedScore: rawBlend, positionScore: rrfScore, positionWeight } =
+      blendConfidenceScore({
+        rerankScore: r.score,
+        rrfRank,
+        armCount: armCountByFile.get(r.file) ?? 1,
+        poolSize: candidates.length,
+      });
+
+    const exactMatch = textMatchesIdentifier(candidate?.title, identTerms)
+      || textMatchesIdentifier(candidate?.displayPath, identTerms);
+    const blendedScore = exactMatch ? Math.max(rawBlend, EXACT_MATCH_SCORE) : rawBlend;
+
     const chunkInfo = docChunkMap.get(r.file);
     const bestIdx = chunkInfo?.bestIdx ?? 0;
     const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidate?.body || "";
@@ -4993,7 +5157,7 @@ export async function structuredSearch(
       rrf: {
         rank: rrfRank,
         positionScore: rrfScore,
-        weight: rrfWeight,
+        weight: positionWeight,
         baseScore: trace?.baseScore ?? 0,
         topRankBonus: trace?.topRankBonus ?? 0,
         totalScore: trace?.totalScore ?? 0,
