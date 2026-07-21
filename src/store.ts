@@ -2999,31 +2999,52 @@ function sanitizeHyphenatedTerm(term: string): string {
 }
 
 /**
- * Parse lex query syntax into FTS5 query.
+ * Interrogative / function-word stoplist used ONLY to relax the keyword (FTS5)
+ * query when a strict AND of every term matches nothing.
  *
- * Supports:
- * - Quoted phrases: "exact phrase" → "exact phrase" (exact match)
- * - Negation: -term or -"phrase" → uses FTS5 NOT operator
- * - Hyphenated tokens: multi-agent, DEC-0054, gpt-4 → treated as phrases
- * - Plain terms: term → "term"* (prefix match)
- *
- * FTS5 NOT is a binary operator: `term1 NOT term2` means "match term1 but not term2".
- * So `-term` only works when there are also positive terms.
- *
- * Hyphen disambiguation: `-sports` at a word boundary is negation, but `multi-agent`
- * (where `-` is between word characters) is treated as a hyphenated phrase.
- * When a leading `-` is followed by what looks like a hyphenated compound word
- * (e.g., `-multi-agent`), the entire token is treated as a negated phrase.
- *
- * Examples:
- *   performance -sports     → "performance"* NOT "sports"*
- *   "machine learning"      → "machine learning"
- *   multi-agent memory      → "multi agent" AND "memory"*
- *   DEC-0054               → "dec 0054"
- *   -multi-agent            → NOT "multi agent"
+ * Rationale: phrasing a search as a natural-language question ("where does X
+ * live", "which files use Y") injects words the indexed documents never
+ * contain. Because {@link buildFTS5Query} ANDs every term, a single such word
+ * turns a strong keyword match into zero results — the phrasing-sensitivity
+ * bug. These words carry little retrieval signal, so dropping them on the
+ * fallback pass restores the exact-term match. We keep this list conservative:
+ * only genuine function words and interrogatives, never content nouns/verbs
+ * (idiomatic content words like "live"/"use" are handled by the OR tier
+ * instead, so they are safe to keep out of this list).
  */
-function buildFTS5Query(query: string): string | null {
-  const positive: string[] = [];
+const FTS_STOPWORDS = new Set<string>([
+  // interrogatives / question frames
+  "where", "what", "which", "who", "whom", "whose", "when", "why", "how",
+  // auxiliary / copula verbs
+  "does", "do", "did", "is", "are", "was", "were", "be", "been", "being",
+  "am", "can", "could", "should", "would", "will", "shall", "may", "might",
+  "has", "have", "had",
+  // articles / determiners / pronouns
+  "a", "an", "the", "this", "that", "these", "those", "it", "its", "there",
+  // common prepositions / conjunctions
+  "of", "to", "in", "on", "at", "for", "and", "or", "with", "into", "from",
+  "by", "as", "about",
+]);
+
+interface FtsPositiveTerm {
+  /** FTS5-formatted term, e.g. `"consultant"*` or `"multi agent"`. */
+  fts: string;
+  /** Lowercased base word used for stopword membership tests. */
+  word: string;
+}
+
+interface ParsedFtsTerms {
+  positive: FtsPositiveTerm[];
+  negative: string[];
+}
+
+/**
+ * Tokenize a lex query into FTS5-formatted positive/negative terms.
+ * Shared by {@link buildFTS5Query} and the tiered fallback in
+ * {@link searchFTS}. See {@link buildFTS5Query} for the supported syntax.
+ */
+function parseFTS5Terms(query: string): ParsedFtsTerms {
+  const positive: FtsPositiveTerm[] = [];
   const negative: string[] = [];
 
   let i = 0;
@@ -3052,7 +3073,7 @@ function buildFTS5Query(query: string): string | null {
           if (negated) {
             negative.push(ftsPhrase);
           } else {
-            positive.push(ftsPhrase);
+            positive.push({ fts: ftsPhrase, word: sanitized.toLowerCase() });
           }
         }
       }
@@ -3071,7 +3092,7 @@ function buildFTS5Query(query: string): string | null {
           if (negated) {
             negative.push(ftsPhrase);
           } else {
-            positive.push(ftsPhrase);
+            positive.push({ fts: ftsPhrase, word: sanitized.toLowerCase() });
           }
         }
       } else if (containsCjk(term)) {
@@ -3081,7 +3102,7 @@ function buildFTS5Query(query: string): string | null {
           if (negated) {
             negative.push(ftsPhrase);
           } else {
-            positive.push(ftsPhrase);
+            positive.push({ fts: ftsPhrase, word: sanitized.toLowerCase() });
           }
         }
       } else {
@@ -3091,20 +3112,26 @@ function buildFTS5Query(query: string): string | null {
           if (negated) {
             negative.push(ftsTerm);
           } else {
-            positive.push(ftsTerm);
+            positive.push({ fts: ftsTerm, word: sanitized.toLowerCase() });
           }
         }
       }
     }
   }
 
-  if (positive.length === 0 && negative.length === 0) return null;
+  return { positive, negative };
+}
 
+/** Compose FTS5-formatted positive/negative terms into a MATCH string. */
+function composeFTS5Query(
+  positive: FtsPositiveTerm[],
+  negative: string[],
+  combine: 'AND' | 'OR' = 'AND',
+): string | null {
   // If only negative terms, we can't search (FTS5 NOT is binary)
   if (positive.length === 0) return null;
 
-  // Join positive terms with AND
-  let result = positive.join(' AND ');
+  let result = positive.map(t => t.fts).join(` ${combine} `);
 
   // Add NOT clause for negative terms
   for (const neg of negative) {
@@ -3112,6 +3139,122 @@ function buildFTS5Query(query: string): string | null {
   }
 
   return result;
+}
+
+/**
+ * Parse lex query syntax into FTS5 query.
+ *
+ * Supports:
+ * - Quoted phrases: "exact phrase" → "exact phrase" (exact match)
+ * - Negation: -term or -"phrase" → uses FTS5 NOT operator
+ * - Hyphenated tokens: multi-agent, DEC-0054, gpt-4 → treated as phrases
+ * - Plain terms: term → "term"* (prefix match)
+ *
+ * FTS5 NOT is a binary operator: `term1 NOT term2` means "match term1 but not term2".
+ * So `-term` only works when there are also positive terms.
+ *
+ * Hyphen disambiguation: `-sports` at a word boundary is negation, but `multi-agent`
+ * (where `-` is between word characters) is treated as a hyphenated phrase.
+ * When a leading `-` is followed by what looks like a hyphenated compound word
+ * (e.g., `-multi-agent`), the entire token is treated as a negated phrase.
+ *
+ * Examples:
+ *   performance -sports     → "performance"* NOT "sports"*
+ *   "machine learning"      → "machine learning"
+ *   multi-agent memory      → "multi agent" AND "memory"*
+ *   DEC-0054               → "dec 0054"
+ *   -multi-agent            → NOT "multi agent"
+ */
+function buildFTS5Query(query: string): string | null {
+  const { positive, negative } = parseFTS5Terms(query);
+  if (positive.length === 0 && negative.length === 0) return null;
+  return composeFTS5Query(positive, negative, 'AND');
+}
+
+interface FtsTier {
+  /** FTS5 MATCH string for this tier. */
+  query: string;
+  /**
+   * For the relaxed OR tier: require each returned document to contain at
+   * least this many of {@link coverageTerms}. Prevents a single common word
+   * (e.g. Python "annotations") from matching an unrelated multi-word query.
+   * Undefined = no coverage filter (strict AND tiers already require all terms).
+   */
+  minCoverage?: number;
+  /** Base words checked for the coverage filter. */
+  coverageTerms?: string[];
+}
+
+/**
+ * Build an ordered list of FTS5 tiers for phrasing-robust keyword retrieval.
+ * {@link searchFTS} runs these in order and returns the first tier that
+ * produces results, so the strict/precise query always wins when it matches
+ * and the relaxed tiers only act as a fallback.
+ *
+ * Tiers:
+ *  1. strict — AND of every term (current, unchanged behavior).
+ *  2. content-AND — AND of non-stopword terms (drops interrogative/function
+ *     words like "where"/"does"/"the" that documents never contain).
+ *  3. content-OR — OR of non-stopword terms, ranked by BM25, but requiring each
+ *     result to cover at least two of the content terms. Recovers matches when
+ *     an idiomatic content word (e.g. "live"/"use") prevents an AND match,
+ *     while the coverage floor keeps a lone common word from matching an
+ *     unrelated query.
+ *
+ * Genuine no-match queries survive: if fewer than two content terms appear
+ * together in any document, every tier returns nothing.
+ */
+function buildFTS5QueryTiers(query: string): FtsTier[] {
+  const { positive, negative } = parseFTS5Terms(query);
+  if (positive.length === 0) return [];
+
+  const tiers: FtsTier[] = [];
+  const seen = new Set<string>();
+  const push = (q: string | null, extra?: Omit<FtsTier, 'query'>) => {
+    if (q && !seen.has(q)) {
+      seen.add(q);
+      tiers.push({ query: q, ...extra });
+    }
+  };
+
+  // Tier 1: strict AND of all terms (unchanged behavior).
+  push(composeFTS5Query(positive, negative, 'AND'));
+
+  const content = positive.filter(t => !FTS_STOPWORDS.has(t.word));
+
+  // Only relax when stripping stopwords actually changes the term set and
+  // leaves something to search for.
+  if (content.length > 0 && content.length < positive.length) {
+    // Tier 2: strict AND of content terms only.
+    push(composeFTS5Query(content, negative, 'AND'));
+  }
+
+  // Tier 3: OR of content terms — last-resort recall for idiomatic phrasings.
+  // Requires ≥2 content terms (so a single common word can't flood results)
+  // AND that each result actually covers ≥2 of them.
+  if (content.length >= 2) {
+    push(composeFTS5Query(content, negative, 'OR'), {
+      minCoverage: 2,
+      coverageTerms: content.map(t => t.word),
+    });
+  }
+
+  return tiers;
+}
+
+/**
+ * Count how many of `terms` (base words) appear in a document's title+body.
+ * A prefix/substring check that mirrors FTS5 prefix matching closely enough
+ * for the OR-tier coverage floor. Phrase terms carry an embedded space
+ * ("multi agent") and are matched literally.
+ */
+function countTermCoverage(title: string | undefined, body: string | undefined, terms: string[]): number {
+  const haystack = `${title}\n${body}`.toLowerCase();
+  let n = 0;
+  for (const term of terms) {
+    if (term && haystack.includes(term)) n++;
+  }
+  return n;
 }
 
 /**
@@ -3139,9 +3282,31 @@ export function validateLexQuery(query: string): string | null {
 }
 
 export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
-  const ftsQuery = buildFTS5Query(query);
-  if (!ftsQuery) return [];
+  // Phrasing-robust keyword retrieval: try the strict AND query first, then
+  // progressively relaxed tiers (drop interrogative/function words, then OR of
+  // content terms). The first tier that matches wins, so precise queries are
+  // unaffected and question-style phrasings ("where does X live") no longer
+  // collapse to zero results. See buildFTS5QueryTiers.
+  const tiers = buildFTS5QueryTiers(query);
+  for (const tier of tiers) {
+    if (tier.minCoverage && tier.coverageTerms) {
+      // Over-fetch, then keep only documents covering enough content terms,
+      // then trim back to the requested limit.
+      const raw = runFTS(db, tier.query, limit * 5, collectionName);
+      const filtered = raw.filter(
+        r => countTermCoverage(r.title, r.body, tier.coverageTerms!) >= tier.minCoverage!,
+      ).slice(0, limit);
+      if (filtered.length > 0) return filtered;
+    } else {
+      const results = runFTS(db, tier.query, limit, collectionName);
+      if (results.length > 0) return results;
+    }
+  }
+  return [];
+}
 
+/** Execute a single FTS5 MATCH string and map rows to SearchResults. */
+function runFTS(db: Database, ftsQuery: string, limit: number, collectionName?: string): SearchResult[] {
   // Use a CTE to force FTS5 to run first, then filter by collection.
   // Without the CTE, SQLite's query planner combines FTS5 MATCH with the
   // collection filter in a single WHERE clause, which can cause it to

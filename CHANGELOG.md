@@ -10,6 +10,17 @@
 
 ### Fixes
 
+- Keyword search: phrasing-robust FTS5 fallback. A natural-language question
+  ("where does consultant availability live", "which files use X endpoint")
+  used to AND every token — including interrogative/idiom words like
+  "where"/"does"/"live" that documents never contain — turning a strong match
+  into zero results, which in turn starved the reranker of the correct
+  candidate. `searchFTS` now tries the strict AND first (unchanged), then falls
+  back to an AND of content terms (dropping a small interrogative/function-word
+  stoplist), then an OR of content terms ranked by BM25 with a two-term
+  coverage floor. Precise queries are unaffected; question phrasings retrieve
+  again; genuinely-absent queries (e.g. "kubernetes ingress annotations") still
+  return nothing because no document covers ≥2 content terms.
 - Embedding: `qmd embed -c <collection>` now scopes pending-doc selection
   to the requested collection instead of embedding global pending work.
   Scoped `--force` clears only collection-owned vectors, preserves shared
