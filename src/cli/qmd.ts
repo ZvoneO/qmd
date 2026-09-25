@@ -4060,7 +4060,9 @@ async function checkEmbeddingVectorSamples(db: Database, model: string, fingerpr
     return { ok: false, details: "no current embedded chunks to test; please run qmd embed again" };
   }
 
-  const threshold = 0.0001;
+  // Vectors stored by a llama-server pool differ from in-process ones by
+  // ~0.0003 (GPU kernel rounding); genuine pipeline drift measures 0.3+.
+  const threshold = 0.005;
   const mismatches: string[] = [];
 
   await withLLMSession(async (session) => {

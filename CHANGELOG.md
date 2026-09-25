@@ -53,6 +53,12 @@
   loads bodies for the sampled hashes only. It previously sorted every current
   chunk joined to its full document text under `ORDER BY random()` (307k
   chunks → 307 GB; `qmd doctor` reached 94 GB RSS and OOM'd the host → 0.2s).
+- Embedding: in-process embed contexts set `batchSize` to the context size.
+  node-llama-cpp defaults to 512, which split longer chunks for the non-causal
+  embeddinggemma model: local vectors for >512-token inputs drifted 0.3–0.6
+  cosine distance from llama-server's, and `qmd doctor` flagged every sample.
+  The doctor sample threshold is now 0.005 (was 0.0001), above the ~0.0003
+  GPU rounding between pool and in-process backends.
 - Embedding: incomplete-doc cleanup judges each doc by rows carrying the
   current fingerprint. Counting every row made a re-embed delete the older,
   still-searchable vectors of docs the run never reached (pool path passes

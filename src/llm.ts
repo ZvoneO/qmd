@@ -1240,6 +1240,10 @@ export class LlamaCpp implements LLM {
         try {
           this.embedContexts.push(await model.createEmbeddingContext({
             contextSize: LlamaCpp.EMBED_CONTEXT_SIZE,
+            // Non-causal embedding models must see the whole input in one
+            // batch. node-llama-cpp defaults to 512, so 900-token chunks were
+            // split and embedded wrong (cosine distance 0.3-0.6 vs llama-server).
+            batchSize: LlamaCpp.EMBED_CONTEXT_SIZE,
             ...(threads > 0 ? { threads } : {}),
           }));
         } catch {
