@@ -13,7 +13,6 @@
 
 import {
   getLlama,
-  getLlamaGpuTypes,
   resolveModelFile,
   LlamaLogLevel,
   type Llama,
@@ -192,24 +191,14 @@ async function main() {
   console.log("  QMD Reranker Benchmark");
   console.log("═══════════════════════════════════════════════════════════════\n");
 
-  // Detect GPU
-  const gpuTypes = await getLlamaGpuTypes();
-  const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
-
-  let llama: Llama;
-  let gpuLabel: string;
-  if (preferred) {
-    try {
-      llama = await getLlama({ gpu: preferred, logLevel: LlamaLogLevel.error });
-      gpuLabel = `${preferred}`;
-    } catch {
-      llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
-      gpuLabel = "cpu (gpu init failed)";
-    }
-  } else {
-    llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
-    gpuLabel = "cpu";
-  }
+  const llama = await getLlama({
+    // attempt to build
+    build: "autoAttempt",
+    logLevel: LlamaLogLevel.error
+  });
+  let gpuLabel: string = llama.gpu === false
+    ? "cpu"
+    : llama.gpu;
 
   // System info
   const cpuInfo = cpus();
@@ -271,16 +260,18 @@ async function main() {
       const r = await benchmarkConfig(model, llama, docs, p, true);
       results.push(r);
       process.stdout.write(` ${r.medianMs.toFixed(0)}ms (${r.docsPerSec.toFixed(1)} docs/s)\n`);
-    } catch (e: any) {
-      process.stdout.write(` failed: ${e.message}\n`);
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      process.stdout.write(` failed: ${message}\n`);
       // Try without flash
       process.stdout.write(`  [${p} ctx, no flash] running...`);
       try {
         const r = await benchmarkConfig(model, llama, docs, p, false);
         results.push(r);
         process.stdout.write(` ${r.medianMs.toFixed(0)}ms (${r.docsPerSec.toFixed(1)} docs/s)\n`);
-      } catch (e2: any) {
-        process.stdout.write(` failed: ${e2.message}\n`);
+      } catch (e2: unknown) {
+        const message = e2 instanceof Error ? e2.message : String(e2);
+        process.stdout.write(` failed: ${message}\n`);
       }
     }
   }

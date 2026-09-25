@@ -8,7 +8,8 @@ QMD queries are structured documents with typed sub-queries. Each line specifies
 query          = expand_query | query_document ;
 expand_query   = text | explicit_expand ;
 explicit_expand= "expand:" text ;
-query_document = { typed_line } ;
+query_document = [ intent_line ] { typed_line } ;
+intent_line    = "intent:" text newline ;
 typed_line     = type ":" text newline ;
 type           = "lex" | "vec" | "hyde" ;
 text           = quoted_phrase | plain_text ;
@@ -101,34 +102,77 @@ error handling best practices
 
 Both forms call the local query expansion model, which generates lex, vec, and hyde variations automatically.
 
+## Intent
+
+An optional `intent:` line provides background context to disambiguate ambiguous queries. It steers query expansion, reranking, and snippet extraction but does not search on its own.
+
+- At most one `intent:` line per query document
+- `intent:` cannot appear alone — at least one `lex:`, `vec:`, or `hyde:` line is required
+- Intent is also available via the `--intent` CLI flag or MCP `intent` parameter
+
+```
+intent: web page load times and Core Web Vitals
+lex: performance
+vec: how to improve performance
+```
+
+Without intent, "performance" is ambiguous (web-perf? team health? fitness?). With intent, the search pipeline preferentially selects and ranks web-performance content.
+
 ## Constraints
 
 - Top-level query must be either a standalone expand query or a multi-line document
-- Query documents allow only `lex`, `vec`, and `hyde` typed lines (no `expand:` inside)
+- Query documents allow only `lex`, `vec`, `hyde`, and `intent` typed lines (no `expand:` inside)
 - `lex` syntax (`-term`, `"phrase"`) only works in lex queries
+- At most one `intent:` line per query document; cannot appear alone
 - Empty lines are ignored
 - Leading/trailing whitespace is trimmed
 
-## MCP/HTTP API
+## Scoping
 
-The `query` tool accepts a query document:
+Restrict queries to specific collections with `-c` (CLI) or `collections` (MCP/SDK):
 
-```json
-{
-  "q": "lex: CAP theorem\nvec: consistency vs availability",
-  "collections": ["docs"],
-  "limit": 10
-}
+```bash
+# CLI — by collection name (see `qmd collection list`)
+qmd query -c docs "how does auth work"
+qmd query -c docs -c notes $'lex: auth\nvec: authentication flow'
 ```
 
-Or structured format:
+For MCP / HTTP, pass a plural `collections` array (OR match):
+
+```json
+{ "searches": [ { "type": "lex", "query": "auth" } ], "collections": ["docs", "notes"] }
+```
+
+`-c`/`collections` matches by collection name and works from any directory.
+Multiple values are OR-combined. Without scoping, all default-included collections
+are searched; collections marked excluded (`qmd collection exclude <name>`) are
+skipped unless explicitly named. In MCP the parameter is the plural `collections`
+array — a singular `collection` is silently ignored.
+
+## MCP/HTTP API
+
+The `query` tool (and the REST `/query` endpoint) accept a structured query with a
+`searches` array. There is no `q` string parameter — `searches` is required:
 
 ```json
 {
   "searches": [
     { "type": "lex", "query": "CAP theorem" },
     { "type": "vec", "query": "consistency vs availability" }
-  ]
+  ],
+  "collections": ["docs"],
+  "limit": 10
+}
+```
+
+With intent:
+
+```json
+{
+  "searches": [
+    { "type": "lex", "query": "performance" }
+  ],
+  "intent": "web page load times and Core Web Vitals"
 }
 ```
 
@@ -143,4 +187,10 @@ qmd query $'lex: auth token\nvec: how does authentication work'
 
 # Structured
 qmd query $'lex: keywords\nvec: question\nhyde: hypothetical answer...'
+
+# With intent (inline)
+qmd query $'intent: web performance and latency\nlex: performance\nvec: how to improve performance'
+
+# With intent (flag)
+qmd query --intent "web performance and latency" "performance"
 ```

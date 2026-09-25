@@ -29,6 +29,14 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 1
 fi
 
+# Verify bun.lock is in sync with package.json
+if ! bun install --frozen-lockfile &>/dev/null; then
+  echo "Error: bun.lock is out of sync with package.json" >&2
+  echo "Run 'bun install' and commit the updated lockfile." >&2
+  exit 1
+fi
+echo "bun.lock: in sync ✓"
+
 # Read current version
 CURRENT=$(jq -r .version package.json)
 echo "Current version: $CURRENT"
@@ -85,7 +93,7 @@ echo ""
 
 # --- Rename [Unreleased] -> [X.Y.Z] - date, add fresh [Unreleased] ---
 
-sed -i '' "s/^## \[Unreleased\].*/## [$NEW] - $DATE/" CHANGELOG.md
+perl -0pi -e 's/^## \[Unreleased\].*/## ['"$NEW"'] - '"$DATE"'/m' CHANGELOG.md
 
 # Insert a new empty [Unreleased] section after the header
 awk '
@@ -100,7 +108,18 @@ awk '
 
 jq --arg v "$NEW" '.version = $v' package.json > package.json.tmp && mv package.json.tmp package.json
 
-git add package.json CHANGELOG.md
+# Keep the Claude Code plugin version in lockstep with the package version.
+# The plugin cache is keyed on this version: if it never changes, installed
+# plugins never pick up skill updates shipped in this release. (sed, not jq,
+# to preserve the file's formatting; the file has a single "version" key.)
+# The grep guard fails the release if the stamp didn't land (a non-matching
+# sed exits 0, which set -e would never catch).
+sed 's/"version": "[^"]*"/"version": "'"$NEW"'"/' \
+  .claude-plugin/marketplace.json > .claude-plugin/marketplace.json.tmp
+grep -qF "\"version\": \"$NEW\"" .claude-plugin/marketplace.json.tmp
+mv .claude-plugin/marketplace.json.tmp .claude-plugin/marketplace.json
+
+git add package.json CHANGELOG.md .claude-plugin/marketplace.json
 git commit -m "release: v$NEW"
 git tag -a "v$NEW" -m "v$NEW"
 
