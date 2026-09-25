@@ -58,6 +58,11 @@ const docs: Doc[] = [
       "Calendar endpoint exposing GET and POST for calendar entries used by the " +
       "scheduling UI.",
   },
+  {
+    file: "agents.md",
+    title: "docs/agents.md",
+    body: "Notes on multi-agent orchestration and handoff between workers.",
+  },
 ];
 
 describe("FTS phrasing-robust tiers", () => {
@@ -117,6 +122,21 @@ describe("FTS phrasing-robust tiers", () => {
 
   test("query about an entirely absent topic returns nothing", () => {
     expect(top("redis pubsub replication lag")).toEqual([]);
+  });
+
+  test("OR tier applies negation to every alternative, not just the last", () => {
+    // Strict AND fails (no doc has consultant + scheduling), so this reaches the
+    // OR tier. `a OR b OR c NOT d` would bind as `a OR b OR (c NOT d)` and let
+    // the calendar doc back in through "scheduling".
+    const results = top("consultant scheduling entries -endpoint");
+    expect(results).toContain("app/domain/services/availability_detection_service.py");
+    expect(results).not.toContain("app/api/v1/calendar.py");
+  });
+
+  test("OR-tier coverage counts hyphenated compounds ('multi-agent')", () => {
+    // "kubernetes" is absent, so only the OR tier can match; the doc covers
+    // "multi agent" + "orchestration" only if the raw hyphen is normalized.
+    expect(top("multi-agent orchestration kubernetes")).toContain("docs/agents.md");
   });
 
   test("single content word that is absent returns nothing", () => {

@@ -2308,6 +2308,10 @@ async function vectorIndex(
 
     closeDb();
   } finally {
+    // Restore the terminal when embedFn throws (unreachable pool, dimension
+    // mismatch); both calls are idempotent on the success path.
+    progress.clear();
+    cursor.show();
     embedLock.release();
   }
 }

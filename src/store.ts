@@ -1941,13 +1941,13 @@ export type EmbedOptions = {
   onProgress?: (info: EmbedProgress) => void;
 };
 
-type PendingEmbeddingDoc = {
+export type PendingEmbeddingDoc = {
   hash: string;
   path: string;
   bytes: number;
 };
 
-type EmbeddingDoc = PendingEmbeddingDoc & {
+export type EmbeddingDoc = PendingEmbeddingDoc & {
   body: string;
 };
 
@@ -2051,7 +2051,7 @@ function withLazyContentVectorMigration<T>(db: Database, operation: () => T): T 
   }
 }
 
-function getPendingEmbeddingDocs(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): PendingEmbeddingDoc[] {
+export function getPendingEmbeddingDocs(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): PendingEmbeddingDoc[] {
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
   const fingerprint = getEmbeddingFingerprint(model);
   return withLazyContentVectorMigration(db, () => {
@@ -2106,7 +2106,7 @@ function buildEmbeddingBatches(
   return batches;
 }
 
-function getEmbeddingDocsForBatch(db: Database, batch: PendingEmbeddingDoc[]): EmbeddingDoc[] {
+export function getEmbeddingDocsForBatch(db: Database, batch: PendingEmbeddingDoc[]): EmbeddingDoc[] {
   if (batch.length === 0) return [];
 
   const placeholders = batch.map(() => "?").join(",");
@@ -4047,6 +4047,7 @@ export function sanitizeFTS5Term(term: string): string {
  * behaviour #305 shipped. The apostrophe is kept for the same reason.
  */
 const FTS5_SEPARATOR_RUN = /[^\p{L}\p{N}'_]+/u;
+const FTS5_SEPARATOR_RUN_G = new RegExp(FTS5_SEPARATOR_RUN.source, 'gu');
 
 /**
  * Split one query term the way the tokenizer split the document text, and
@@ -4192,6 +4193,12 @@ function composeFTS5Query(
   if (positive.length === 0) return null;
 
   let result = positive.map(t => t.fts).join(` ${combine} `);
+  // FTS5 binds NOT tighter than OR: `a OR b NOT c` is `a OR (b NOT c)`, so a
+  // negation would only exclude from the last alternative. AND needs no
+  // parens (and the strict tier stays token-identical to upstream).
+  if (combine === 'OR' && positive.length > 1 && negative.length > 0) {
+    result = `(${result})`;
+  }
 
   // Add NOT clause for negative terms
   for (const neg of negative) {
@@ -4312,7 +4319,9 @@ function buildFTS5QueryTiers(query: string): FtsTier[] {
  * ("multi agent") and are matched literally.
  */
 function countTermCoverage(title: string | undefined, body: string | undefined, terms: string[]): number {
-  const haystack = `${title}\n${body}`.toLowerCase();
+  // Collapse separator runs the same way terms were split, so the phrase term
+  // "multi agent" matches raw "multi-agent".
+  const haystack = `${title}\n${body}`.toLowerCase().replace(FTS5_SEPARATOR_RUN_G, ' ');
   let n = 0;
   for (const term of terms) {
     if (term && haystack.includes(term)) n++;
@@ -4833,7 +4842,7 @@ export function insertEmbedding(
   });
 }
 
-function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: Map<string, number>, model: string): number {
+export function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: Map<string, number>, model: string): number {
   return withLazyContentVectorMigration(db, () => {
     let removed = 0;
     const rowsStmt = db.prepare(`SELECT seq FROM content_vectors WHERE hash = ? AND model = ?`);

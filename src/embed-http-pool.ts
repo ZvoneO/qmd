@@ -20,6 +20,11 @@ import {
   extractTitle,
   insertEmbedding,
   clearAllEmbeddings,
+  getEmbeddingFingerprint,
+  getPendingEmbeddingDocs,
+  getEmbeddingDocsForBatch,
+  removeIncompleteEmbeddings,
+  type EmbeddingDoc,
 } from "./store.js";
 import { BackendLifecycle, loadBackendConfig } from "./embed-lifecycle.js";
 
@@ -332,7 +337,8 @@ export class HttpEmbedPool {
   async embedStream(
     texts: string[],
     onBatch: (startIdx: number, results: (EmbeddingResult | null)[]) => void,
-    subBatchSize: number = 16
+    subBatchSize: number = 16,
+    shouldStop?: () => boolean,
   ): Promise<void> {
     const urls = await this.ensureActive();
     const queue: { startIdx: number; texts: string[] }[] = [];
@@ -349,6 +355,7 @@ export class HttpEmbedPool {
       let pendingWrite: { startIdx: number; results: (EmbeddingResult | null)[] } | null = null;
 
       while (true) {
+        if (shouldStop?.()) break;
         const idx = queueIdx++;
         if (idx >= queue.length) break;
         const item = queue[idx]!;
@@ -462,29 +469,18 @@ export function printPoolStats(): void {
 // goes through the vec0-safe insertEmbedding() exported from store.ts.
 // =============================================================================
 
-type PendingDoc = {
-  hash: string;
-  path: string;
-  bytes: number;
-  body: string;
-};
-
-function fetchPendingDocs(db: Database, collection?: string): PendingDoc[] {
-  const collectionFilter = collection ? `AND d.collection = ?` : ``;
-  const stmt = db.prepare(`
-    SELECT
-      d.hash AS hash,
-      MIN(d.path) AS path,
-      length(CAST(c.doc AS BLOB)) AS bytes,
-      c.doc AS body
-    FROM documents d
-    JOIN content c ON d.hash = c.hash
-    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-    WHERE d.active = 1 AND v.hash IS NULL ${collectionFilter}
-    GROUP BY d.hash
-    ORDER BY MIN(d.path)
-  `);
-  return (collection ? stmt.all(collection) : stmt.all()) as PendingDoc[];
+// Pending set comes from upstream getPendingEmbeddingDocs (model + fingerprint
+// + partial-doc aware) so the pool embeds exactly what `qmd status` /
+// vectorIndex count as pending. Bodies are loaded in slices to stay under
+// SQLite's bound-parameter limit.
+function fetchPendingDocs(db: Database, collection: string | undefined, model: string): EmbeddingDoc[] {
+  const pending = getPendingEmbeddingDocs(db, collection, model);
+  const out: EmbeddingDoc[] = [];
+  const SLICE = 500;
+  for (let i = 0; i < pending.length; i += SLICE) {
+    out.push(...getEmbeddingDocsForBatch(db, pending.slice(i, i + SLICE)));
+  }
+  return out;
 }
 
 type ChunkItem = {
@@ -494,6 +490,7 @@ type ChunkItem = {
   seq: number;
   pos: number;
   bytes: number;
+  totalChunks: number;
 };
 
 /**
@@ -502,7 +499,7 @@ type ChunkItem = {
  *
  * Flow:
  *   1. Optionally clear existing embeddings if force=true.
- *   2. Pull pending docs (those without seq=0 entry in content_vectors).
+ *   2. Pull pending docs (missing, stale-fingerprint, or partially embedded).
  *   3. Chunk each doc with upstream's chunkDocumentByTokens.
  *   4. Probe pool, ensure vec0 table at the discovered dimension.
  *   5. embedStream() fans batches across all servers; each callback writes
@@ -519,7 +516,8 @@ export async function generateEmbeddingsViaPool(
     clearAllEmbeddings(db, options.collection);
   }
 
-  const docs = fetchPendingDocs(db, options?.collection);
+  const embedModelUri = options?.model ?? "embeddinggemma";
+  const docs = fetchPendingDocs(db, options?.collection, embedModelUri);
   if (docs.length === 0) {
     return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
   }
@@ -530,6 +528,7 @@ export async function generateEmbeddingsViaPool(
   // is fast even for tens of thousands; embedding is the real bottleneck.
   const encoder = new TextEncoder();
   const allChunks: ChunkItem[] = [];
+  const expectedChunksByHash = new Map<string, number>();
   for (const doc of docs) {
     if (!doc.body || !doc.body.trim()) continue;
     const title = extractTitle(doc.body, doc.path);
@@ -548,8 +547,10 @@ export async function generateEmbeddingsViaPool(
         seq,
         pos: c.pos,
         bytes: encoder.encode(c.text).length,
+        totalChunks: chunks.length,
       });
     }
+    expectedChunksByHash.set(doc.hash, chunks.length);
   }
 
   if (allChunks.length === 0) {
@@ -571,72 +572,95 @@ export async function generateEmbeddingsViaPool(
     await lifecycle.prepare(urls, lifecycleConfig);
   }
 
-  // Pool probe + dimension discovery + vec0 table init.
-  await pool.embedBatch(["__probe__"]); // primes ensureActive() + dimensions
-  const dims = pool.getDimensions();
-  if (!dims) {
-    throw new Error("Failed to detect embedding dimensions from pool probe");
-  }
-  store.ensureVecTable(dims);
-
-  const embedModelUri = options?.model ?? "embeddinggemma";
-  const texts = allChunks.map(c => formatDocForEmbedding(c.text, c.title, embedModelUri));
-  const now = new Date().toISOString();
-  const model = options?.model ?? embedModelUri;
-
   let chunksEmbedded = 0;
   let errors = 0;
-  let bytesProcessed = 0;
-  const totalChunks = allChunks.length;
 
-  // SUB_BATCH balances two pressures: large = closer to /v1/embeddings
-  // ceiling (per-request overhead amortized), small = better parallelism
-  // (each server pulls work independently from the queue). On a tiny
-  // corpus, large SUB_BATCH means one server gets the whole job — the
-  // others sit idle. Auto-pick scales with corpus size and pool size,
-  // capped at 128 to keep memory peaks bounded.
-  const numServers = pool.getActiveUrls().length;
-  const auto = Math.min(
-    128,
-    Math.max(16, Math.floor(totalChunks / Math.max(numServers, 1) / 4)),
-  );
-  const SUB_BATCH = process.env.QMD_EMBED_SUB_BATCH
-    ? Number(process.env.QMD_EMBED_SUB_BATCH)
-    : auto;
+  try {
+    // Pool probe + dimension discovery + vec0 table init.
+    await pool.embedBatch(["__probe__"]); // primes ensureActive() + dimensions
+    const dims = pool.getDimensions();
+    if (!dims) {
+      throw new Error("Failed to detect embedding dimensions from pool probe");
+    }
+    store.ensureVecTable(dims);
 
-  await pool.embedStream(texts, (startIdx, results) => {
-    // Wrap each callback's inserts in a single transaction.
-    // better-sqlite3 transactions are synchronous and run faster than
-    // per-row autocommit, which matters when the pool fires many small
-    // sub-batches concurrently from different workers.
-    const slice = results;
-    const tx = db.transaction(() => {
-      for (let i = 0; i < slice.length; i++) {
-        const chunkIdx = startIdx + i;
-        const chunk = allChunks[chunkIdx]!;
-        const result = slice[i];
-        if (result) {
-          insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
-          chunksEmbedded++;
-        } else {
-          errors++;
+    const texts = allChunks.map(c => formatDocForEmbedding(c.text, c.title, embedModelUri));
+    const now = new Date().toISOString();
+    const model = embedModelUri;
+    const fingerprint = getEmbeddingFingerprint(model);
+
+    let bytesProcessed = 0;
+    const totalChunks = allChunks.length;
+
+    // Upstream's 30-min default would cut long pool runs short, so only an
+    // explicit --timeout applies: stop dequeuing, flush in-flight writes, and
+    // leave the rest pending for the next run.
+    const deadline = options?.maxDurationMs ? startTime + options.maxDurationMs : Infinity;  // 0 = no limit
+    let timedOut = false;
+    const shouldStop = () => (timedOut ||= Date.now() >= deadline);
+
+    // SUB_BATCH balances two pressures: large = closer to /v1/embeddings
+    // ceiling (per-request overhead amortized), small = better parallelism
+    // (each server pulls work independently from the queue). On a tiny
+    // corpus, large SUB_BATCH means one server gets the whole job — the
+    // others sit idle. Auto-pick scales with corpus size and pool size,
+    // capped at 128 to keep memory peaks bounded.
+    const numServers = pool.getActiveUrls().length;
+    const auto = Math.min(
+      128,
+      Math.max(16, Math.floor(totalChunks / Math.max(numServers, 1) / 4)),
+    );
+    const SUB_BATCH = process.env.QMD_EMBED_SUB_BATCH
+      ? Number(process.env.QMD_EMBED_SUB_BATCH)
+      : auto;
+
+    await pool.embedStream(texts, (startIdx, results) => {
+      // Wrap each callback's inserts in a single transaction.
+      // better-sqlite3 transactions are synchronous and run faster than
+      // per-row autocommit, which matters when the pool fires many small
+      // sub-batches concurrently from different workers.
+      const slice = results;
+      const tx = db.transaction(() => {
+        for (let i = 0; i < slice.length; i++) {
+          const chunkIdx = startIdx + i;
+          const chunk = allChunks[chunkIdx]!;
+          const result = slice[i];
+          if (result) {
+            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now, chunk.totalChunks, fingerprint);
+            chunksEmbedded++;
+          } else {
+            errors++;
+          }
+          bytesProcessed += chunk.bytes;
         }
-        bytesProcessed += chunk.bytes;
-      }
-    });
-    tx();
+      });
+      tx();
 
-    options?.onProgress?.({
-      chunksEmbedded,
-      totalChunks,
-      bytesProcessed,
-      totalBytes,
-      errors,
-    });
-  }, SUB_BATCH);
+      options?.onProgress?.({
+        chunksEmbedded,
+        totalChunks,
+        bytesProcessed,
+        totalBytes,
+        errors,
+      });
+    }, SUB_BATCH, shouldStop);
 
-  // Stop any backends we started (adopted ones left alone).
-  await lifecycle.cleanup();
+    // Chunks the pool never returned (server dropped, queue abandoned, or
+    // timeout) are failures too, not just explicit null results.
+    errors = Math.max(errors, totalChunks - chunksEmbedded);
+    if (timedOut) {
+      process.stderr.write(`\nHttpEmbedPool: --timeout reached; ${totalChunks - chunksEmbedded} chunks left pending\n`);
+    }
+
+    // Docs where some chunks failed must not look complete (upstream
+    // partial-pending logic keys on total_chunks); drop them so the next
+    // run retries the whole doc.
+    const removedPartialChunks = removeIncompleteEmbeddings(db, expectedChunksByHash, model);
+    chunksEmbedded = Math.max(0, chunksEmbedded - removedPartialChunks);
+  } finally {
+    // Stop any backends we started (adopted ones left alone).
+    await lifecycle.cleanup();
+  }
 
   return {
     docsProcessed: totalDocs,

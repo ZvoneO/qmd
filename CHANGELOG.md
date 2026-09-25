@@ -30,6 +30,16 @@
   coverage floor. Precise queries are unaffected; question phrasings retrieve
   again; genuinely-absent queries (e.g. "kubernetes ingress annotations") still
   return nothing because no document covers ≥2 content terms.
+- Keyword search: the OR fallback tier now wraps alternatives before negation
+  (`(a OR b) NOT c`); FTS5 binds NOT tighter than OR, so `-term` previously
+  excluded only from the last alternative. The coverage floor also matches
+  compound terms ("multi-agent") against raw text.
+- Embed pool: aligned with upstream embedding freshness. The HTTP pool now
+  selects pending docs by model + fingerprint + partial-chunk state (legacy
+  pool rows with an empty fingerprint used to show as pending in `status` while
+  `embed` found nothing to do), records `total_chunks`/fingerprint per row,
+  drops partially embedded docs so they retry, counts never-returned chunks as
+  errors, honors an explicit `--timeout`, and always stops started backends.
 - Embedding: on-demand backend lifecycle. `~/.config/qmd/embed-backends.yaml` declares per-URL SSH target + start/stop shell scripts. Already-running servers are adopted (left alone); cold ones are started over SSH and stopped on process exit. Avoids Ollama-vs-llama-server VRAM conflicts by letting `start` scripts stop conflicting Ollama models before launching llama-server.
 - Embedding: SUB_BATCH auto-pick. Default sub-batch is now `min(128, max(16, totalChunks / (numServers * 4)))` when `QMD_EMBED_SUB_BATCH` is unset — keeps small corpora parallel and lets large ones approach the per-request ceiling. Env override still honored.
 - Embedding: multi-server HTTP pool (`QMD_EMBED_URLS`) now auto-detects llama-server vs Ollama backends. llama-server URLs are probed via `GET /health` and use OpenAI `POST /v1/embeddings`; URLs without `/health` fall back to Ollama `POST /api/embed`. Mixed pools work transparently. Measured 10× end-to-end speedup vs the previous Ollama-only path on a 288-chunk corpus; raw llama-server ceiling ~1200 c/s aggregate for a 2-node cluster. New env var `QMD_EMBED_SUB_BATCH` (default 64) tunes per-request batch size.
