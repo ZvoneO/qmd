@@ -4885,7 +4885,10 @@ export function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: M
   const fingerprint = getEmbeddingFingerprint(model);
   return withLazyContentVectorMigration(db, () => {
     let removed = 0;
-    const rowsStmt = db.prepare(`SELECT seq, embed_fingerprint AS fp FROM content_vectors WHERE hash = ? AND model = ?`);
+    // Unary + keeps the planner on the (hash, seq) primary key; left to itself
+    // it picks the (model, ...) index, which scans every row of the model
+    // once per doc (22k docs x 368k rows: minutes at 100% CPU).
+    const rowsStmt = db.prepare(`SELECT seq, embed_fingerprint AS fp FROM content_vectors WHERE hash = ? AND +model = ?`);
     const deleteRowStmt = db.prepare(`DELETE FROM content_vectors WHERE hash = ? AND seq = ?`);
     const deleteVecStmt = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
 
