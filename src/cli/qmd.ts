@@ -4037,16 +4037,24 @@ async function checkEmbeddingVectorSamples(db: Database, model: string, fingerpr
     return { ok: false, details: "no vector table to test; please run qmd embed again" };
   }
 
-  const samples = db.prepare(`
-    SELECT cv.hash, cv.seq, c.doc AS body, MIN(d.path) AS path
+  // Pick random (hash, seq) keys first, then load bodies for the sampled
+  // hashes only. Grouping by c.doc under ORDER BY random() fed every current
+  // chunk's full document text into the sort (307k chunks → 307 GB; doctor
+  // grew to 94 GB RSS inside one uninterruptible statement and OOM'd the box).
+  const keys = db.prepare(`
+    SELECT cv.hash, cv.seq,
+      (SELECT MIN(d.path) FROM documents d WHERE d.hash = cv.hash AND d.active = 1) AS path
     FROM content_vectors cv
-    JOIN documents d ON d.hash = cv.hash AND d.active = 1
-    JOIN content c ON c.hash = cv.hash
     WHERE cv.model = ? AND cv.embed_fingerprint = ?
-    GROUP BY cv.hash, cv.seq, c.doc
+      AND EXISTS (SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1)
     ORDER BY random()
     LIMIT ?
-  `).all(model, fingerprint, sampleSize) as { hash: string; seq: number; body: string; path: string }[];
+  `).all(model, fingerprint, sampleSize) as { hash: string; seq: number; path: string }[];
+  const bodyStmt = db.prepare(`SELECT doc FROM content WHERE hash = ?`);
+  const samples = keys.flatMap((key) => {
+    const content = bodyStmt.get(key.hash) as { doc: string } | undefined;
+    return content ? [{ ...key, body: content.doc }] : [];
+  });
 
   if (samples.length === 0) {
     return { ok: false, details: "no current embedded chunks to test; please run qmd embed again" };

@@ -49,6 +49,10 @@
   and loads one document body, instead of grouping every legacy chunk by its
   full text (368k chunks: `qmd doctor` hung 10+ min in one uninterruptible
   statement → 4s).
+- Doctor: embedding vector sample picks random `(hash, seq)` keys first and
+  loads bodies for the sampled hashes only. It previously sorted every current
+  chunk joined to its full document text under `ORDER BY random()` (307k
+  chunks → 307 GB; `qmd doctor` reached 94 GB RSS and OOM'd the host → 0.2s).
 - Embedding: incomplete-doc cleanup judges each doc by rows carrying the
   current fingerprint. Counting every row made a re-embed delete the older,
   still-searchable vectors of docs the run never reached (pool path passes
