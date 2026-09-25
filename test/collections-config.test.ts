@@ -6,9 +6,11 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "vitest";
+import { mkdtemp, rm, writeFile } from "fs/promises";
+import { tmpdir } from "os";
 import { join } from "path";
 import { qmdHomedir } from "../src/paths.js";
-import { getConfigPath, setConfigIndexName } from "../src/collections.js";
+import { getConfigPath, loadConfig, setConfigIndexName } from "../src/collections.js";
 
 // Save/restore env vars around each test
 let savedEnv: Record<string, string | undefined>;
@@ -81,5 +83,25 @@ describe("getConfigDir via getConfigPath", () => {
     process.env.XDG_CONFIG_HOME = "/xdg/config";
     setConfigIndexName("myindex");
     expect(getConfigPath()).toBe(join("/xdg/config", "qmd", "myindex.yml"));
+  });
+
+  test("sanitizes a Windows absolute index name into a safe filename", () => {
+    delete process.env.QMD_CONFIG_DIR;
+    process.env.XDG_CONFIG_HOME = "/xdg/config";
+    setConfigIndexName("C:\\Users\\axulo\\Documents\\ppttest");
+    expect(getConfigPath()).toBe(
+      join("/xdg/config", "qmd", "C_Users_axulo_Documents_ppttest.yml")
+    );
+  });
+
+  test("loadConfig treats an empty YAML file as an empty config", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "qmd-empty-config-"));
+    try {
+      process.env.QMD_CONFIG_DIR = dir;
+      await writeFile(join(dir, "index.yml"), "");
+      expect(loadConfig()).toEqual({ collections: {} });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

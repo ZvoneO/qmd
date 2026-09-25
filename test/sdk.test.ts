@@ -614,6 +614,20 @@ describe("search (unified API)", () => {
     expect(results.length).toBeGreaterThan(0);
   });
 
+  test("search() forwards candidateLimit to structured search", async () => {
+    const results = await store.search({
+      queries: [
+        { type: "lex", query: "authentication" },
+        { type: "lex", query: "meeting" },
+      ],
+      limit: 5,
+      candidateLimit: 1,
+      rerank: false,
+    });
+
+    expect(results).toHaveLength(1);
+  });
+
   // Tests below use search({ query: ... }) which triggers LLM query expansion
   describe.skipIf(!!process.env.CI)("with LLM query expansion", () => {
     test("search() with query and rerank:false returns results", async () => {
@@ -746,6 +760,20 @@ describe("get and multiGet", () => {
     }
   });
 
+  test("multiGet retrieves a document by docid", async () => {
+    const doc = await store.get("qmd://docs/readme.md");
+    if (!("error" in doc)) {
+      const { docs, errors } = await store.multiGet(`#${doc.docid}`, { includeBody: true });
+      expect(errors).toHaveLength(0);
+      expect(docs).toHaveLength(1);
+      expect(docs[0]!.doc.docid).toBe(doc.docid);
+      expect(docs[0]!.skipped).toBe(false);
+      if (!docs[0]!.skipped) {
+        expect(docs[0]!.doc.body).toContain("getting started guide");
+      }
+    }
+  });
+
   test("multiGet retrieves multiple documents", async () => {
     const { docs, errors } = await store.multiGet("qmd://docs/*.md");
     expect(docs.length).toBeGreaterThan(0);
@@ -821,6 +849,7 @@ describe("update", () => {
     expect(result.updated).toBe(0);
     expect(result.unchanged).toBe(0);
     expect(result.removed).toBe(0);
+    expect(result.skipped).toBe(0);
     expect(typeof result.needsEmbedding).toBe("number");
 
     await store.close();
@@ -931,12 +960,16 @@ describe("embed", () => {
       async tokenize(text: string) {
         return new Array(Math.max(1, Math.ceil(text.length / 16))).fill(1);
       },
+      async detokenize(tokens: readonly number[]) {
+        return "x".repeat(tokens.length * 16);
+      },
     };
   }
 
   function createFakeEmbedLlm() {
     const embedBatchCalls: string[][] = [];
     return {
+      ...createFakeTokenizer(),
       embedBatchCalls,
       async embed(_text: string) {
         return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };

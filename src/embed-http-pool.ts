@@ -609,7 +609,8 @@ export async function generateEmbeddingsViaPool(
     // better-sqlite3 transactions are synchronous and run faster than
     // per-row autocommit, which matters when the pool fires many small
     // sub-batches concurrently from different workers.
-    const tx = db.transaction((slice: typeof results) => {
+    const slice = results;
+    const tx = db.transaction(() => {
       for (let i = 0; i < slice.length; i++) {
         const chunkIdx = startIdx + i;
         const chunk = allChunks[chunkIdx]!;
@@ -623,7 +624,7 @@ export async function generateEmbeddingsViaPool(
         bytesProcessed += chunk.bytes;
       }
     });
-    tx(results);
+    tx();
 
     options?.onProgress?.({
       chunksEmbedded,
