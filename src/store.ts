@@ -3303,9 +3303,32 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // Embeddings
 // =============================================================================
 
+// Option B: process-wide single-backend pool for QUERY embedding, pointed at the
+// local llama-server (mean pooling). Docs embedded via the HTTP pool live in this
+// same mean space; embedding queries inprocess (node-llama-cpp, off-label pooling)
+// yields an orthogonal vector that can't match them (recall@1 ~0.64 vs ~0.82).
+// Opt-in via QMD_QUERY_EMBED_URL=http://127.0.0.1:8081.
+let queryEmbedPool: any = null;
+
 async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LlamaCpp): Promise<number[] | null> {
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
+
+  const queryUrl = isQuery ? (process.env.QMD_QUERY_EMBED_URL?.trim() || null) : null;
+  if (queryUrl) {
+    try {
+      if (!queryEmbedPool) {
+        const { HttpEmbedPool } = await import("./embed-http-pool.js"); // dynamic: avoid import cycle
+        queryEmbedPool = new HttpEmbedPool({ urls: [queryUrl] });
+      }
+      const pooled = await queryEmbedPool.embed(formattedText);
+      if (pooled?.embedding) return pooled.embedding;
+      process.stderr.write(`qmd: query-embed backend ${queryUrl} returned no embedding; falling back to inprocess\n`);
+    } catch (err: any) {
+      process.stderr.write(`qmd: query-embed backend ${queryUrl} unreachable (${err?.message || err}); falling back to inprocess\n`);
+    }
+  }
+
   const result = session
     ? await session.embed(formattedText, { model, isQuery })
     : await (llmOverride ?? getDefaultLlamaCpp()).embed(formattedText, { model, isQuery });
