@@ -1628,6 +1628,24 @@ describe("FTS Search", () => {
     await cleanupTestDb(store);
   });
 
+  test("searchFTS scoped to every configured collection excludes orphaned docs", async () => {
+    // CLI without -c and MCP pass every default collection; that scope runs one
+    // IN (...) query rather than a per-collection fan-out, and must still drop
+    // docs left behind by a collection that was removed from config.
+    const store = await createTestStore();
+    const alpha = await createTestCollection({ name: "alpha", pwd: "/test/alpha" });
+    const beta = await createTestCollection({ name: "beta", pwd: "/test/beta" });
+    await insertTestDocument(store.db, alpha, { name: "a", title: "Alpha", body: "memory in alpha", displayPath: "a.md" });
+    await insertTestDocument(store.db, beta, { name: "b", title: "Beta", body: "memory in beta", displayPath: "b.md" });
+    await insertTestDocument(store.db, "removed", { name: "o", title: "memory memory", body: "memory orphan", displayPath: "o.md" });
+
+    expect(store.searchFTS("memory", 10).map(r => r.collectionName)).toContain("removed");
+    const scoped = store.searchFTS("memory", 10, [alpha, beta]);
+    expect(scoped.map(r => r.collectionName).sort()).toEqual([alpha, beta]);
+
+    await cleanupTestDb(store);
+  });
+
   test("searchFTS finds CJK documents by exact and mixed queries", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();

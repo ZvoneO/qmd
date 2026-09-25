@@ -4364,6 +4364,30 @@ function scopedCollectionNames(scope: CollectionScope): string[] | undefined {
   return names.length > 0 ? names : undefined;
 }
 
+type CollectionFilter = string | readonly string[];
+
+/**
+ * How to apply a collection scope. An explicit subset fans out per collection
+ * so a large unrelated collection cannot starve the rest (#775). A scope that
+ * names every configured collection (CLI without -c, MCP defaults) is one
+ * `IN (...)` query instead: fanning out there ran a full search per
+ * collection (78 collections: FTS 0.2s -> 8s, vsearch >180s) to exclude only
+ * orphaned docs of removed collections.
+ */
+function resolveSearchScope(db: Database, scope: CollectionScope): { filter?: CollectionFilter; fanOut?: string[]; coversAll?: boolean } {
+  const names = scopedCollectionNames(scope);
+  if (!names) return {};
+  if (names.length === 1) return { filter: names[0] };
+  const requested = new Set(names);
+  const configured = db.prepare(`SELECT name FROM store_collections`).all() as { name: string }[];
+  return configured.every(row => requested.has(row.name)) ? { filter: names, coversAll: true } : { fanOut: names };
+}
+
+function collectionFilterSql(filter: CollectionFilter, alias: string): { sql: string; params: string[] } {
+  if (typeof filter === "string") return { sql: `${alias}.collection = ?`, params: [filter] };
+  return { sql: `${alias}.collection IN (${filter.map(() => "?").join(",")})`, params: [...filter] };
+}
+
 function mergeSearchResultsByScore(lists: SearchResult[][], limit: number): SearchResult[] {
   const best = new Map<string, SearchResult>();
   for (const list of lists) {
@@ -4378,13 +4402,10 @@ function mergeSearchResultsByScore(lists: SearchResult[][], limit: number): Sear
 }
 
 export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string | readonly string[], filter?: MetadataFilter): SearchResult[] {
-  const names = scopedCollectionNames(collectionName);
-  // Search each requested collection before merging/truncating so a large
-  // unrelated collection cannot occupy global top-k and starve the rest (#775).
-  if (names && names.length > 1) {
-    return mergeSearchResultsByScore(names.map(name => searchFTS(db, query, limit, name, filter)), limit);
+  const { filter: collectionFilter, fanOut } = resolveSearchScope(db, collectionName);
+  if (fanOut) {
+    return mergeSearchResultsByScore(fanOut.map(name => searchFTS(db, query, limit, name, filter)), limit);
   }
-  const collectionFilter = names?.[0];
 
   // Phrasing-robust keyword retrieval: try the strict AND query first, then
   // progressively relaxed tiers (drop interrogative/function words, then OR of
@@ -4410,7 +4431,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 }
 
 /** Execute a single FTS5 MATCH string and map rows to SearchResults. */
-function runFTS(db: Database, ftsQuery: string, limit: number, collectionFilter?: string, filter?: MetadataFilter): SearchResult[] {
+function runFTS(db: Database, ftsQuery: string, limit: number, collectionFilter?: CollectionFilter, filter?: MetadataFilter): SearchResult[] {
   // Use a CTE to force FTS5 to run first, then filter by collection.
   // Without the CTE, SQLite's query planner combines FTS5 MATCH with the
   // collection filter in a single WHERE clause, which can cause it to
@@ -4449,8 +4470,9 @@ function runFTS(db: Database, ftsQuery: string, limit: number, collectionFilter?
   `;
 
   if (collectionFilter) {
-    sql += ` AND d.collection = ?`;
-    params.push(String(collectionFilter));
+    const scoped = collectionFilterSql(collectionFilter, "d");
+    sql += ` AND ${scoped.sql}`;
+    params.push(...scoped.params);
   }
 
   if (filter) {
@@ -4561,14 +4583,13 @@ export async function searchVec(db: Database, query: string, model: string, limi
   const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session, llm);
   if (!embedding) return [];
 
-  const names = scopedCollectionNames(collectionName);
-  if (names && names.length > 1) {
+  const { filter: collectionFilter, fanOut, coversAll } = resolveSearchScope(db, collectionName);
+  if (fanOut) {
     const lists = await Promise.all(
-      names.map(name => searchVec(db, query, model, limit, name, session, embedding, llm, filter)),
+      fanOut.map(name => searchVec(db, query, model, limit, name, session, embedding, llm, filter)),
     );
     return mergeSearchResultsByScore(lists, limit);
   }
-  const collectionFilter = names?.[0];
 
   // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
   // hang indefinitely when combined with JOINs in the same query. Do NOT try to
@@ -4585,7 +4606,10 @@ export async function searchVec(db: Database, query: string, model: string, limi
   // enough, and only then fall back to capped ANN + post-filter.
   let vecResults: { hash_seq: string; distance: number }[];
 
-  if (collectionFilter || filter) {
+  // A scope covering every configured collection only drops orphaned docs, so
+  // the eligible-set scan (a DISTINCT over every vector) buys nothing: use
+  // global ANN and let the document join below apply the IN filter.
+  if ((collectionFilter && !coversAll) || filter) {
     let eligibleSql = `
       SELECT DISTINCT cv.hash || '_' || cv.seq AS hash_seq
       FROM content_vectors cv
@@ -4595,8 +4619,9 @@ export async function searchVec(db: Database, query: string, model: string, limi
     const eligibleParams: (string | number)[] = [];
 
     if (collectionFilter) {
-      eligibleConditions.push(`d.collection = ?`);
-      eligibleParams.push(collectionFilter);
+      const scoped = collectionFilterSql(collectionFilter, "d");
+      eligibleConditions.push(scoped.sql);
+      eligibleParams.push(...scoped.params);
     }
 
     if (filter) {
@@ -4653,8 +4678,9 @@ export async function searchVec(db: Database, query: string, model: string, limi
   const params: (string | number)[] = [...hashSeqs];
 
   if (collectionFilter) {
-    docSql += ` AND d.collection = ?`;
-    params.push(collectionFilter);
+    const scoped = collectionFilterSql(collectionFilter, "d");
+    docSql += ` AND ${scoped.sql}`;
+    params.push(...scoped.params);
   }
 
   if (filter) {
