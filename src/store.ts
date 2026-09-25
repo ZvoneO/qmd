@@ -4876,23 +4876,38 @@ export function insertEmbedding(
   });
 }
 
+// Judges each doc by the rows written with the current fingerprint only.
+// Counting every row misfires on a re-embed: a doc this run never reached
+// would lose its older (still searchable) vectors whenever its chunk count
+// changed, and a doc that now has fewer chunks keeps a stale tail that never
+// matches, so it is wiped and re-embedded on every run.
 export function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: Map<string, number>, model: string): number {
+  const fingerprint = getEmbeddingFingerprint(model);
   return withLazyContentVectorMigration(db, () => {
     let removed = 0;
-    const rowsStmt = db.prepare(`SELECT seq FROM content_vectors WHERE hash = ? AND model = ?`);
-    const deleteContentStmt = db.prepare(`DELETE FROM content_vectors WHERE hash = ? AND model = ?`);
+    const rowsStmt = db.prepare(`SELECT seq, embed_fingerprint AS fp FROM content_vectors WHERE hash = ? AND model = ?`);
+    const deleteRowStmt = db.prepare(`DELETE FROM content_vectors WHERE hash = ? AND seq = ?`);
     const deleteVecStmt = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
 
-    for (const [hash, expectedChunks] of expectedChunksByHash) {
-      const rows = rowsStmt.all(hash, model) as { seq: number }[];
-      if (rows.length === 0 || rows.length === expectedChunks) continue;
+    db.transaction(() => {
+      for (const [hash, expectedChunks] of expectedChunksByHash) {
+        const rows = rowsStmt.all(hash, model) as { seq: number; fp: string }[];
+        const current = rows.filter(r => r.fp === fingerprint && r.seq < expectedChunks).length;
+        if (current === 0) continue;
 
-      for (const row of rows) {
-        deleteVecStmt.run(`${hash}_${row.seq}`);
+        // Complete: drop only leftovers (stale tail, other fingerprints).
+        // Partial: drop the whole doc so the next run retries it.
+        const complete = current === expectedChunks;
+        const doomed = complete
+          ? rows.filter(r => r.fp !== fingerprint || r.seq >= expectedChunks)
+          : rows;
+        for (const row of doomed) {
+          deleteVecStmt.run(`${hash}_${row.seq}`);
+          deleteRowStmt.run(hash, row.seq);
+        }
+        if (!complete) removed += current;
       }
-      deleteContentStmt.run(hash, model);
-      removed += rows.length;
-    }
+    })();
 
     return removed;
   });

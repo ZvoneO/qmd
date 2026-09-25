@@ -49,6 +49,13 @@
   and loads one document body, instead of grouping every legacy chunk by its
   full text (368k chunks: `qmd doctor` hung 10+ min in one uninterruptible
   statement → 4s).
+- Embedding: incomplete-doc cleanup judges each doc by rows carrying the
+  current fingerprint. Counting every row made a re-embed delete the older,
+  still-searchable vectors of docs the run never reached (pool path passes
+  every pending doc; one autocommit vec0 delete each pinned a CPU for 15+ min
+  after `--timeout`), and left a doc that now chunks shorter with a stale tail
+  that forced a full wipe and re-embed on every run. Deletes run in one
+  transaction.
 - Embedding: on-demand backend lifecycle. `~/.config/qmd/embed-backends.yaml` declares per-URL SSH target + start/stop shell scripts. Already-running servers are adopted (left alone); cold ones are started over SSH and stopped on process exit. Avoids Ollama-vs-llama-server VRAM conflicts by letting `start` scripts stop conflicting Ollama models before launching llama-server.
 - Embedding: SUB_BATCH auto-pick. Default sub-batch is now `min(128, max(16, totalChunks / (numServers * 4)))` when `QMD_EMBED_SUB_BATCH` is unset — keeps small corpora parallel and lets large ones approach the per-request ceiling. Env override still honored.
 - Embedding: multi-server HTTP pool (`QMD_EMBED_URLS`) now auto-detects llama-server vs Ollama backends. llama-server URLs are probed via `GET /health` and use OpenAI `POST /v1/embeddings`; URLs without `/health` fall back to Ollama `POST /api/embed`. Mixed pools work transparently. Measured 10× end-to-end speedup vs the previous Ollama-only path on a 288-chunk corpus; raw llama-server ceiling ~1200 c/s aggregate for a 2-node cluster. New env var `QMD_EMBED_SUB_BATCH` (default 64) tunes per-request batch size.

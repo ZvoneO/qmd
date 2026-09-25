@@ -58,6 +58,7 @@ import {
   cleanupOrphanedVectors,
   generateEmbeddings,
   maybeAdoptLegacyEmbeddingFingerprint,
+  removeIncompleteEmbeddings,
   getHybridRrfWeights,
   _resetProductionModeForTesting,
   hybridQuery,
@@ -3131,6 +3132,38 @@ describe("Index Status", () => {
 
     expect(getEmbeddingFingerprint(model)).toMatch(/^[a-f0-9]{6}$/);
     expect(store.getHashesNeedingEmbedding()).toBe(1);
+
+    await cleanupTestDb(store);
+  });
+
+  test("removeIncompleteEmbeddings judges docs by current-fingerprint rows only", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    const model = "hf:test/embed-model.gguf";
+    const now = new Date().toISOString();
+    const vec = new Float32Array([1, 2, 3]);
+    const count = (hash: string) =>
+      (store.db.prepare(`SELECT COUNT(*) AS n FROM content_vectors WHERE hash = ?`).get(hash) as { n: number }).n;
+
+    store.llm = { embedModelName: model } as any;
+    store.ensureVecTable(3);
+    for (const hash of ["shrunk", "untouched", "partial"]) {
+      await insertTestDocument(store.db, collectionName, { name: hash, hash });
+      for (let seq = 0; seq < 3; seq++) store.insertEmbedding(hash, seq, seq, vec, model, now, 3, "");
+    }
+    // Re-embedded as 2 chunks: seq 2 is a stale legacy tail.
+    for (let seq = 0; seq < 2; seq++) store.insertEmbedding("shrunk", seq, seq, vec, model, now, 2);
+    // Only 1 of 2 new chunks came back.
+    store.insertEmbedding("partial", 0, 0, vec, model, now, 2);
+
+    const removed = removeIncompleteEmbeddings(store.db, new Map([["shrunk", 2], ["untouched", 2], ["partial", 2]]), model);
+
+    expect(removed).toBe(1);
+    expect(count("shrunk")).toBe(2);
+    expect(count("untouched")).toBe(3);
+    expect(count("partial")).toBe(0);
+    expect((store.db.prepare(`SELECT COUNT(*) AS n FROM vectors_vec`).get() as { n: number }).n).toBe(5);
+    expect(store.getHashesNeedingEmbedding()).toBe(2);
 
     await cleanupTestDb(store);
   });
