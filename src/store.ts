@@ -2735,16 +2735,24 @@ export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: 
     return { checked: false, adopted: 0, reason: "no legacy empty-fingerprint embeddings" };
   }
 
-  const sample = withLazyContentVectorMigration(db, () => db.prepare(`
-    SELECT cv.hash, cv.seq, cv.pos, cv.total_chunks, c.doc AS body, MIN(d.path) AS path
-    FROM content_vectors cv
-    JOIN documents d ON d.hash = cv.hash AND d.active = 1
-    JOIN content c ON c.hash = cv.hash
-    WHERE cv.model = ? AND cv.embed_fingerprint = ''
-    GROUP BY cv.hash, cv.seq, cv.pos, cv.total_chunks, c.doc
-    ORDER BY cv.hash, cv.seq
-    LIMIT 1
-  `).get(model) as { hash: string; seq: number; pos: number; total_chunks: number; body: string; path: string } | undefined);
+  // Walk content_vectors in primary-key order and stop at the first active
+  // row; the body is fetched for that one hash only. Grouping by c.doc here
+  // sorted every legacy chunk by its full document text (368k chunks: doctor
+  // hung for 10+ minutes inside one uninterruptible statement).
+  const sample = withLazyContentVectorMigration(db, () => {
+    const row = db.prepare(`
+      SELECT cv.hash, cv.seq, cv.pos, cv.total_chunks,
+        (SELECT MIN(d.path) FROM documents d WHERE d.hash = cv.hash AND d.active = 1) AS path
+      FROM content_vectors cv
+      WHERE cv.model = ? AND cv.embed_fingerprint = ''
+        AND EXISTS (SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1)
+      ORDER BY cv.hash, cv.seq
+      LIMIT 1
+    `).get(model) as { hash: string; seq: number; pos: number; total_chunks: number; path: string } | undefined;
+    if (!row) return undefined;
+    const content = db.prepare(`SELECT doc FROM content WHERE hash = ?`).get(row.hash) as { doc: string } | undefined;
+    return content ? { ...row, body: content.doc } : undefined;
+  });
 
   if (!sample) {
     return { checked: false, adopted: 0, reason: `${legacyCount} legacy docs have no active sample` };
